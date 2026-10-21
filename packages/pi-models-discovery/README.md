@@ -77,7 +77,7 @@ Forces a rediscovery of every discovery provider and updates the local cache, no
 - **Offline / fetch failure**: handwritten `models` in models.json (if any) are kept as a fallback, and an explicit warning is surfaced via in-session notify — never a silent degradation. One provider failing does not affect the others.
 - **apiKey resolution** (discovery request only): supports literals and `$ENV_VAR` / `${ENV_VAR}` interpolation; `!command` values skip discovery with an explicit warning (chat requests are still resolved by pi itself and are unaffected).
 - When metadata is absent, discovered models default to `reasoning: true`, `input: ["text", "image"]`, zero cost, `contextWindow` 1M, `maxTokens` 64K, and `compat.supportsDeveloperRole: false`. Advertised metadata replaces these defaults as described below. Provider-level `compat` is merged into every discovered model.
-- Discovered models default `thinkingLevelMap.xhigh` / `max` to `null`; extra tiers are no longer assumed to work on every backend. Standard tiers keep Pi's default mapping. Opt in with provider-level `compat.thinkingLevelMap` when the service supports extra tiers, or set any unsupported tier to `null`.
+- Discovered models default `thinkingLevelMap.xhigh` / `max` to `null`; extra tiers are no longer assumed to work on every backend. Standard tiers keep Pi's default mapping. Thinking metadata advertised by the model list can enable or hide tiers per model (see [Thinking levels](#thinking-levels)). Opt in with provider-level `compat.thinkingLevelMap` when the service supports extra tiers, or set any unsupported tier to `null`.
 - For non-reasoning models, set provider-level `compat.reasoning: false` so `/thinking` offers only `off`. `reasoning` and `thinkingLevelMap` are extracted to the model's top level; other `compat` fields (such as `supportsReasoningEffort` and `thinkingFormat`) are forwarded normally. Mixed-model gateways can use `modelOverrides` by model.id. Existing caches apply the current thinking configuration at startup without a network refresh.
 
 Example for a local non-reasoning service. To enable verified extra tiers instead, use `"thinkingLevelMap": { "xhigh": "xhigh", "max": "max" }` and remove `"reasoning": false`.
@@ -113,7 +113,7 @@ Discovery reads each model's metadata using the following precedence (first vali
 | `input` | Always includes `text`. `image` is added when an explicit `input` array containing `text` and/or `image` lists it; otherwise when `capabilities.vision` or `capabilities.image_input` is supported |
 | `reasoning` | Provider `compat.reasoning`, model `reasoning`, `capabilities.reasoning`, `capabilities.thinking` |
 
-Capability values may be booleans or objects such as `{ "supported": false }`. Explicit `false` is preserved: no image support produces `input: ["text"]`, and no reasoning support produces `reasoning: false`. Cached startup and online refresh retain this metadata. Unknown capabilities keep the existing defaults; the extension does not infer extra thinking tiers.
+Capability values may be booleans or objects such as `{ "supported": false }`. Explicit `false` is preserved: no image support produces `input: ["text"]`, and no reasoning support produces `reasoning: false`. Cached startup and online refresh retain this metadata. Unknown capabilities keep the existing defaults; extra thinking tiers are enabled only by advertised thinking metadata.
 
 Token limits must be positive safe integers. Invalid limits fall through to the next alias or the existing defaults. Names must be nonempty strings; unsupported entries in `input` are ignored.
 
@@ -129,6 +129,41 @@ Costs use **prices per one million tokens**, matching Pi's `cost` fields:
 Only finite, nonnegative numbers are accepted; zero is a valid price. Missing or invalid prices default to zero. Prices in other units, long-context tiers, and modality-specific prices are not mapped to these four fields. Use `modelOverrides` for model-specific adjustments.
 
 After upgrading, run `/config:model-discovery-refresh` to replace older cached defaults with the advertised metadata.
+
+### Thinking levels
+
+A model entry can advertise its thinking levels in two ways.
+
+**Explicit map.** `thinkingLevelMap`, then `thinking_level_map`, uses Pi's format. The first alias with at least one valid entry is used as a whole; aliases are not merged. Keys must be `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Values must be nonempty strings (the value sent to the backend) or `null` (hidden). Other entries are ignored.
+
+**Effort capabilities.** `capabilities.effort` lists backend effort values as booleans or `{ "supported": boolean }` objects, as in Anthropic's model list:
+
+```json
+{ "effort": { "supported": true, "low": { "supported": false }, "medium": { "supported": true },
+  "high": { "supported": false }, "max": { "supported": false } } }
+```
+
+It is used only where Pi actually sends that effort value:
+
+| `api` | Condition | Pi level → backend effort |
+| --- | --- | --- |
+| `anthropic-messages` | Provider `compat.forceAdaptiveThinking: true` (`output_config.effort`) | `minimal` and `low` → `low`; other levels keep their names |
+| `openai-responses` | Always (`reasoning.effort`) | Same name |
+| `openai-completions` | `compat.thinkingFormat` absent or `"openai"`, and `compat.supportsReasoningEffort` is not `false` (`reasoning_effort`) | Same name |
+
+If a level's backend value is explicitly supported, the level uses that value. If it is explicitly unsupported, the level is `null`. If it is not listed, the default applies: standard levels stay available and `xhigh` / `max` stay hidden. A level is never remapped to a different backend value. `effort.supported: false`, malformed entries, other APIs, and Anthropic budget thinking (without `forceAdaptiveThinking`, where Pi sends no effort) keep the defaults. With the example above, an adaptive Anthropic model offers only `off` and `medium`. The OpenAI rows assume Pi sends `reasoning_effort`; Pi's URL detection turns it off for some hosts (for example xAI or Z.ai), so set `compat` explicitly there.
+
+Each key is resolved separately, from lowest to highest precedence:
+
+1. Defaults: `xhigh` and `max` are `null`.
+2. Levels derived from `capabilities.effort`.
+3. The model's explicit map.
+4. Provider `compat.thinkingLevelMap`, including explicit `null`.
+5. `modelOverrides[modelId].thinkingLevelMap` in models.json, applied by Pi.
+
+Provider `compat.reasoning: false` still limits every model to `off`.
+
+The cache stores advertised thinking metadata per model and revalidates it at startup. The final map is rebuilt from that metadata and the current provider configuration, so cached startup, offline reads, and online refresh agree. Caches written by older versions have no advertised metadata and keep the defaults, even if they stored extra tiers, until the next online refresh. The metadata is the endpoint's claim; confirm a tier with a real request before relying on it.
 
 ## Uninstall
 

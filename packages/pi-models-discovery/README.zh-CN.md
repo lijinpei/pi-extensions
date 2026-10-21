@@ -77,7 +77,7 @@ pi install npm:pi-models-discovery
 - **离线 / 拉取失败**：保留 models.json 里手写的 `models`（如有，作为回退），并通过会话内 notify 显式警告，不静默降级；单个 provider 失败不影响其他 provider。
 - **apiKey 解析**（仅发现请求）：支持字面量与 `$ENV_VAR` / `${ENV_VAR}` 插值；`!command` 形式跳过发现并显式警告（聊天请求仍由 pi 自身解析执行，不受影响）。
 - 元数据缺失时，发现的模型默认参数为 `reasoning: true`、`input: ["text", "image"]`、cost 全 0、`contextWindow` 1M、`maxTokens` 64K、`compat.supportsDeveloperRole: false`。服务返回的元数据按下表替换这些默认值；provider 级 `compat` 会合并进每个发现的模型。
-- 发现的模型默认将 `thinkingLevelMap.xhigh` / `max` 设为 `null`，不再假定所有后端支持这些额外档位。标准档位仍沿用 Pi 默认映射。若服务支持额外档位，可在 provider 的 `compat.thinkingLevelMap` 中显式开启，也可将任一不支持的档位置为 `null`。
+- 发现的模型默认将 `thinkingLevelMap.xhigh` / `max` 设为 `null`，不再假定所有后端支持这些额外档位。标准档位仍沿用 Pi 默认映射。模型列表声明的思考元数据可逐模型开启或隐藏档位（见[思考档位](#思考档位)）。若服务支持额外档位，可在 provider 的 `compat.thinkingLevelMap` 中显式开启，也可将任一不支持的档位置为 `null`。
 - 非推理模型可设置 provider 的 `compat.reasoning: false`，让 `/thinking` 只提供 `off`。`reasoning` 和 `thinkingLevelMap` 会提取到模型顶层，其余 `compat` 字段（如 `supportsReasoningEffort`、`thinkingFormat`）正常转发。混合模型网关可用 `modelOverrides` 按 model.id 覆盖。旧缓存会在启动时应用当前推理配置，无需联网刷新。
 
 下面是本地非推理服务的配置；若要开启已确认支持的额外档位，改用 `"thinkingLevelMap": { "xhigh": "xhigh", "max": "max" }` 并移除 `"reasoning": false`。
@@ -113,7 +113,7 @@ pi install npm:pi-models-discovery
 | `input` | 始终包含 `text`。显式包含 `text` 和/或 `image` 的 `input` 数组列出 `image` 时加入 `image`；否则看 `capabilities.vision` 或 `capabilities.image_input` 是否支持 |
 | `reasoning` | provider 的 `compat.reasoning`、模型的 `reasoning`、`capabilities.reasoning`、`capabilities.thinking` |
 
-能力字段可为布尔值或 `{ "supported": false }` 这样的对象。显式 `false` 会保留：不支持图片时使用 `input: ["text"]`，不支持推理时使用 `reasoning: false`。缓存启动和在线刷新均保留元数据。未声明的能力沿用既有默认值，插件不会推断额外思考档位。
+能力字段可为布尔值或 `{ "supported": false }` 这样的对象。显式 `false` 会保留：不支持图片时使用 `input: ["text"]`，不支持推理时使用 `reasoning: false`。缓存启动和在线刷新均保留元数据。未声明的能力沿用既有默认值，额外思考档位只由服务声明的思考元数据开启。
 
 token 上限必须为正的安全整数；无效值会回退到下一个别名或既有默认值。名称必须为非空字符串；`input` 中不支持的值会被忽略。
 
@@ -129,6 +129,41 @@ token 上限必须为正的安全整数；无效值会回退到下一个别名�
 仅接受有限的非负数，零是有效价格。缺失或无效价格默认使用零。其他计价单位、长上下文阶梯价和模态专用价格不会映射到这四个字段；逐模型调整可使用 `modelOverrides`。
 
 升级后运行 `/config:model-discovery-refresh`，用服务返回的元数据替换旧缓存中的默认值。
+
+### 思考档位
+
+模型条目可用两种方式声明思考档位。
+
+**显式映射**：依次读取 `thinkingLevelMap`、`thinking_level_map`，格式与 Pi 相同。使用第一个含有效项的别名，整体生效，不跨别名合并。键只能是 `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；值须为非空字符串（发给后端的值）或 `null`（隐藏该档位），其余项忽略。
+
+**effort 能力**：`capabilities.effort` 用布尔值或 `{ "supported": 布尔 }` 列出后端 effort 值，与 Anthropic 模型列表的格式一致：
+
+```json
+{ "effort": { "supported": true, "low": { "supported": false }, "medium": { "supported": true },
+  "high": { "supported": false }, "max": { "supported": false } } }
+```
+
+只在 Pi 实际发送该 effort 值的请求路径上解读：
+
+| `api` | 条件 | Pi 档位 → 后端 effort |
+| --- | --- | --- |
+| `anthropic-messages` | provider 的 `compat.forceAdaptiveThinking: true`（`output_config.effort`） | `minimal` 与 `low` → `low`；其余同名 |
+| `openai-responses` | 始终（`reasoning.effort`） | 同名 |
+| `openai-completions` | 未设置 `compat.thinkingFormat` 或为 `"openai"`，且 `compat.supportsReasoningEffort` 不为 `false`（`reasoning_effort`） | 同名 |
+
+档位对应的后端值显式支持时，该档位映射到这个值；显式不支持时置为 `null`；未列出时沿用默认值：标准档位保留，`xhigh` / `max` 仍隐藏。档位不会改映射到其他后端值。`effort.supported: false`、格式错误的项、其他 API，以及 Anthropic 预算式思考（未设 `forceAdaptiveThinking` 时 Pi 不发送 effort）都沿用默认值。按上例，自适应思考的 Anthropic 模型只提供 `off` 和 `medium`。OpenAI 两行假定 Pi 会发送 `reasoning_effort`；Pi 会按 URL 对部分服务（如 xAI、Z.ai）关闭它，这类服务请显式设置 `compat`。
+
+每个档位单独解析，优先级从低到高：
+
+1. 默认值：`xhigh` 和 `max` 为 `null`。
+2. 由 `capabilities.effort` 推导的档位。
+3. 模型的显式映射。
+4. provider 的 `compat.thinkingLevelMap`，包括显式 `null`。
+5. models.json 中 `modelOverrides[modelId].thinkingLevelMap`，由 Pi 叠加。
+
+provider 的 `compat.reasoning: false` 仍会让所有模型只提供 `off`。
+
+缓存按模型保存服务声明的思考元数据，启动时重新校验，再结合当前 provider 配置重建最终映射，因此缓存启动、离线读取与在线刷新结果一致。旧版本写入的缓存没有声明元数据，即使其中存过额外档位，也沿用默认值，直到下一次在线刷新。元数据只是服务端的声明；依赖某个档位前，请用真实请求确认。
 
 ## 卸载
 

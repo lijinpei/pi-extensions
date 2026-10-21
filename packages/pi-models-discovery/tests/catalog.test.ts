@@ -4,9 +4,12 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { ModelRegistry, ModelRuntime, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { Api, Model, ModelThinkingLevel, SimpleStreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
+import { streamSimple as anthropicStream } from "@earendil-works/pi-ai/api/anthropic-messages";
+import { streamSimple as completionsStream } from "@earendil-works/pi-ai/api/openai-completions";
+import { streamSimple as responsesStream } from "@earendil-works/pi-ai/api/openai-responses";
 import discoveryExtension, { buildModel } from "../src/index.ts";
 
 test("locales catalog provides zh-CN and en-US for every key", () => {
@@ -442,5 +445,227 @@ test("cached startup ignores non-boolean reasoning values", async (t) => {
 	}));
 	await h.start();
 	assert.equal(h.registrations.get("foo")!.models![0].reasoning, true);
+	assert.equal(h.requests.length, 0);
+});
+
+/** 用 Pi 真实的模型注册表组合扩展注册结果与 models.json（含 modelOverrides）。 */
+async function piRegistry(h: { dir: string; registrations: Map<string, Parameters<ExtensionAPI["registerProvider"]>[1]> }) {
+	const runtime = await ModelRuntime.create({
+		authPath: join(h.dir, "auth.json"),
+		modelsPath: join(h.dir, "models.json"),
+		modelsStorePath: join(h.dir, "models-store.json"),
+		refreshOnCreate: false,
+	});
+	const registry = new ModelRegistry(runtime);
+	for (const [id, config] of h.registrations) registry.registerProvider(id, config);
+	return registry;
+}
+
+const requestStreams: Record<string, (model: Model<Api>, context: never, options: SimpleStreamOptions) => AsyncIterable<unknown>> = {
+	"anthropic-messages": anthropicStream as never,
+	"openai-completions": completionsStream as never,
+	"openai-responses": responsesStream as never,
+};
+
+/** 经 Pi 真实的请求转换生成请求体（假 fetch，不联网），返回实际发送的 effort 字段。 */
+async function requestedEffort(model: Model<Api>, reasoning: ThinkingLevel): Promise<unknown> {
+	let payload: Record<string, any> = {};
+	const events = requestStreams[model.api](model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] } as never, {
+		apiKey: "test-key",
+		reasoning,
+		maxRetries: 0,
+		onPayload: (body) => {
+			payload = body as Record<string, any>;
+			return undefined;
+		},
+		fetch: async () => new Response("{}", { status: 400 }),
+	});
+	for await (const _event of events) { /* 请求被假 fetch 拒绝即结束 */ }
+	if (model.api === "anthropic-messages") return payload.output_config?.effort;
+	if (model.api === "openai-responses") return payload.reasoning?.effort;
+	return payload.reasoning_effort;
+}
+
+/** Pi 提供的每个非 off 档位及其实际请求值；结果里没有的档位即 Pi 不提供。 */
+async function offeredEfforts(model: Model<Api>): Promise<Partial<Record<ThinkingLevel, unknown>>> {
+	const efforts: Partial<Record<ThinkingLevel, unknown>> = {};
+	for (const level of getSupportedThinkingLevels(model)) {
+		if (level !== "off") efforts[level] = await requestedEffort(model, level);
+	}
+	return efforts;
+}
+
+const thinkingLevels = (models: unknown[]): ModelThinkingLevel[][] =>
+	models.map((model) => getSupportedThinkingLevels(model as Model<Api>));
+
+test("explicit model thinking maps are validated per alias and omitted levels keep the fallback", async (t) => {
+	const h = await discoveryHarness(t, [
+		{ id: "camel", thinkingLevelMap: { xhigh: "xhigh", max: null, low: null } },
+		{ id: "snake", thinking_level_map: { max: "max", minimal: "low" } },
+		{ id: "camel-wins", thinkingLevelMap: { xhigh: "xhigh" }, thinking_level_map: { max: "max" } },
+		{ id: "malformed-camel", thinkingLevelMap: { xhigh: 1, max: "", turbo: "turbo", high: ["high"] }, thinking_level_map: { max: "max" } },
+		{ id: "partly-valid", thinkingLevelMap: { xhigh: "xhigh", max: true, ultra: "ultra" } },
+		{ id: "invalid", thinkingLevelMap: ["xhigh"], thinking_level_map: "max" },
+	]);
+	await h.configure({ foo: discoveryProvider });
+	await h.start();
+	const models = h.registrations.get("foo")!.models!;
+	assert.deepEqual(models.map((m) => [m.id, m.thinkingLevelMap]), [
+		["camel", { xhigh: "xhigh", max: null, low: null }],
+		["snake", { xhigh: null, max: "max", minimal: "low" }],
+		["camel-wins", { xhigh: "xhigh", max: null }],
+		["malformed-camel", { xhigh: null, max: "max" }],
+		["partly-valid", { xhigh: "xhigh", max: null }],
+		["invalid", { xhigh: null, max: null }],
+	]);
+	assert.deepEqual(thinkingLevels(models), [
+		["off", "minimal", "medium", "high", "xhigh"],
+		["off", "minimal", "low", "medium", "high", "max"],
+		["off", "minimal", "low", "medium", "high", "xhigh"],
+		["off", "minimal", "low", "medium", "high", "max"],
+		["off", "minimal", "low", "medium", "high", "xhigh"],
+		["off", "minimal", "low", "medium", "high"],
+	]);
+});
+
+test("advertised effort support never maps a Pi level to a rejected backend effort", async (t) => {
+	const h = await discoveryHarness(t, [
+		{ id: "observed", capabilities: { thinking: { supported: true }, effort: {
+			supported: true, low: { supported: false }, medium: { supported: true }, high: { supported: false }, max: { supported: false },
+		} } },
+		{ id: "extended", capabilities: { effort: {
+			supported: true, low: { supported: true }, medium: { supported: true }, high: { supported: true },
+			xhigh: { supported: true }, max: { supported: true },
+		} } },
+		{ id: "partial", capabilities: { effort: { low: true, high: { supported: true } } } },
+		{ id: "unsupported", capabilities: { effort: { supported: false, low: { supported: false }, xhigh: { supported: true } } } },
+		{ id: "malformed", capabilities: { effort: { low: "no", xhigh: { supported: "yes" }, max: 1 } } },
+	]);
+	const gateway = { ...discoveryProvider, apiKey: "test-key" };
+	await h.configure({
+		adaptive: { ...gateway, api: "anthropic-messages", compat: { forceAdaptiveThinking: true } },
+		completions: gateway,
+		responses: { ...gateway, api: "openai-responses" },
+		budget: { ...gateway, api: "anthropic-messages" },
+	});
+	await h.start();
+	const registry = await piRegistry(h);
+	const efforts = async (provider: string) => Object.fromEntries(await Promise.all(
+		["observed", "extended", "partial", "unsupported", "malformed"].map(async (id) => [id, await offeredEfforts(registry.find(provider, id)!)]),
+	));
+	const anthropicDefaults = { minimal: "low", low: "low", medium: "medium", high: "high" };
+	assert.deepEqual(await efforts("adaptive"), {
+		observed: { medium: "medium" },
+		extended: { minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
+		partial: anthropicDefaults,
+		unsupported: anthropicDefaults,
+		malformed: anthropicDefaults,
+	});
+	const openAIDefaults = { minimal: "minimal", low: "low", medium: "medium", high: "high" };
+	for (const provider of ["completions", "responses"]) {
+		assert.deepEqual(await efforts(provider), {
+			observed: { minimal: "minimal", medium: "medium" },
+			extended: { minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
+			partial: openAIDefaults,
+			unsupported: openAIDefaults,
+			malformed: openAIDefaults,
+		}, provider);
+	}
+	// 预算式思考不发送 effort，声明的 effort 档位不适用，沿用保守默认值。
+	const budgetDefaults = { minimal: undefined, low: undefined, medium: undefined, high: undefined };
+	assert.deepEqual(await efforts("budget"), {
+		observed: budgetDefaults, extended: budgetDefaults, partial: budgetDefaults, unsupported: budgetDefaults, malformed: budgetDefaults,
+	});
+});
+
+test("provider and per-model overrides take precedence over advertised thinking levels", async (t) => {
+	const h = await discoveryHarness(t, [
+		{ id: "advertised", capabilities: { effort: { low: false, medium: true, high: true, xhigh: true, max: true } } },
+		{ id: "explicit", thinkingLevelMap: { low: "low", max: "max" } },
+		{ id: "overridden" },
+		{ id: "plain" },
+	]);
+	const gateway = { ...discoveryProvider, api: "anthropic-messages", apiKey: "test-key" };
+	await h.configure({
+		foo: {
+			...gateway,
+			// provider 覆盖逐项生效：关闭声明支持的 max，把声明不支持的 low 改映射到 medium。
+			compat: { forceAdaptiveThinking: true, thinkingLevelMap: { max: null, low: "medium" } },
+			modelOverrides: {
+				advertised: { thinkingLevelMap: { high: null, minimal: "low" } },
+				overridden: { thinkingLevelMap: { xhigh: "xhigh" } },
+			},
+		},
+		off: { ...gateway, compat: { forceAdaptiveThinking: true, reasoning: false } },
+	});
+	await h.start();
+	const registry = await piRegistry(h);
+	assert.deepEqual(await offeredEfforts(registry.find("foo", "advertised")!), {
+		minimal: "low", low: "medium", medium: "medium", xhigh: "xhigh",
+	});
+	assert.deepEqual(await offeredEfforts(registry.find("foo", "explicit")!), {
+		minimal: "low", low: "medium", medium: "medium", high: "high",
+	});
+	assert.deepEqual(await offeredEfforts(registry.find("foo", "overridden")!), {
+		minimal: "low", low: "medium", medium: "medium", high: "high", xhigh: "xhigh",
+	});
+	// 同一网关下其他模型不会因某个模型的声明而开放额外档位。
+	assert.deepEqual(await offeredEfforts(registry.find("foo", "plain")!), {
+		minimal: "low", low: "medium", medium: "medium", high: "high",
+	});
+	for (const id of ["advertised", "explicit", "overridden", "plain"]) {
+		assert.deepEqual(getSupportedThinkingLevels(registry.find("off", id)!), ["off"]);
+	}
+});
+
+test("advertised thinking levels survive cached startup and offline reads, and update on online refresh", async (t) => {
+	const effort: Record<string, unknown> = { supported: true, medium: { supported: true }, xhigh: { supported: true } };
+	const h = await discoveryHarness(t, [
+		{ id: "effort", capabilities: { effort } },
+		{ id: "explicit", thinking_level_map: { max: "max" } },
+	]);
+	await h.configure({ foo: { ...discoveryProvider, api: "openai-responses" } });
+	for (let startup = 0; startup < 2; startup++) {
+		await h.start();
+		const config = h.registrations.get("foo")!;
+		for (const models of [config.models!, await config.refreshModels!(refreshContext(false))]) {
+			assert.deepEqual(thinkingLevels(models), [
+				["off", "minimal", "low", "medium", "high", "xhigh"],
+				["off", "minimal", "low", "medium", "high", "max"],
+			]);
+		}
+	}
+	assert.equal(h.requests.length, 1, "cached startup and offline reads must not fetch");
+	effort.medium = { supported: false };
+	effort.xhigh = { supported: false };
+	const changed = [["off", "minimal", "low", "high"], ["off", "minimal", "low", "medium", "high", "max"]];
+	assert.deepEqual(thinkingLevels(await h.registrations.get("foo")!.refreshModels!(refreshContext(true))), changed);
+	await h.start();
+	assert.deepEqual(thinkingLevels(h.registrations.get("foo")!.models!), changed);
+	assert.equal(h.requests.length, 2);
+});
+
+test("cached thinking metadata is revalidated and caches without it keep conservative defaults", async (t) => {
+	const h = await discoveryHarness(t);
+	const provider = { ...discoveryProvider, api: "openai-responses" };
+	await h.configure({ foo: provider });
+	const cacheDir = join(h.dir, "extensions", "pi-models-discovery");
+	await mkdir(cacheDir, { recursive: true });
+	await writeFile(join(cacheDir, "cache.json"), JSON.stringify({
+		version: 1,
+		providers: { foo: {
+			fingerprint: JSON.stringify([provider.baseUrl, provider.api, "", {}, {}]),
+			models: [
+				{ ...buildModel({ id: "legacy" }), thinkingLevelMap: { xhigh: "xhigh", max: "max" } },
+				{ ...buildModel({ id: "tampered" }), thinkingLevelMap: { xhigh: "xhigh", max: "max" } },
+			],
+			advertisedThinking: { tampered: { thinkingLevelMap: { xhigh: 1, max: "" }, effort: { xhigh: "yes", max: { supported: 1 } } } },
+		} },
+	}));
+	await h.start();
+	const config = h.registrations.get("foo")!;
+	for (const models of [config.models!, await config.refreshModels!(refreshContext(false))]) {
+		assert.deepEqual(models.map((m) => m.thinkingLevelMap), [{ xhigh: null, max: null }, { xhigh: null, max: null }]);
+	}
 	assert.equal(h.requests.length, 0);
 });

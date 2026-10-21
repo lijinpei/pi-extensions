@@ -35,8 +35,9 @@
  * - 注册 refreshModels：打开 /model 触发在线刷新时重新发现；
  *   离线初始化（allowNetwork=false）返回上次成功列表（含缓存），尚无成功记录时抛错，
  *   以免空列表清掉 models.json 手写 models。
- * - 发现模型默认隐藏 xhigh/max；provider.compat.thinkingLevelMap 可显式开启或覆盖档位，
- *   provider.compat.reasoning 可关闭推理；逐模型差异用 provider.modelOverrides 覆盖。
+ * - 发现模型默认隐藏 xhigh/max；模型列表声明的 thinkingLevelMap 或 capabilities.effort 可逐模型开启或隐藏档位，
+ *   provider.compat.thinkingLevelMap 逐项覆盖声明，provider.compat.reasoning 可关闭推理；
+ *   逐模型差异用 provider.modelOverrides 覆盖（优先级最高）。
  * - 发现请求的 apiKey 解析仅支持字面量与 $ENV_VAR/${ENV_VAR} 插值；
  *   "!command" 形式的 apiKey 跳过发现（显式警告），pi 发起聊天请求时仍由 pi 自身解析。
  * - /config:model-discovery 命令对 models.json 的修改立即生效（registerProvider 运行时可直接调用）；
@@ -89,6 +90,20 @@ interface DiscoveryProviderEntry {
 	discoverModels?: boolean;
 }
 
+/** 可能对应后端 effort 值的 Pi 思考档位（off 除外）。 */
+const EFFORT_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+type EffortLevel = typeof EFFORT_LEVELS[number];
+const THINKING_LEVELS = ["off", ...EFFORT_LEVELS] as const;
+type ThinkingLevelMap = NonNullable<ProviderModelConfig["thinkingLevelMap"]>;
+
+/** 模型列表声明的思考档位；缓存保存声明本身，注册时再结合 api 与 provider compat 推导映射。 */
+export interface AdvertisedThinking {
+	/** 模型条目显式给出的 Pi 档位映射。 */
+	thinkingLevelMap?: ThinkingLevelMap;
+	/** capabilities.effort 中逐个后端 effort 值的支持情况；未声明的值不出现。 */
+	effort?: Partial<Record<EffortLevel, boolean>>;
+}
+
 /** 模型列表条目按别名归一后的元数据；缺失字段由 buildModel 补默认值。 */
 export interface ModelMetadata {
 	id: string;
@@ -97,6 +112,7 @@ export interface ModelMetadata {
 	maxTokens?: number;
 	input?: ProviderModelConfig["input"];
 	reasoning?: boolean;
+	thinking?: AdvertisedThinking;
 	cost?: Partial<ModelCostRates>;
 }
 
@@ -105,6 +121,14 @@ interface CachedProviderEntry {
 	fingerprint: string;
 	fetchedAt: string;
 	models: ProviderModelConfig[];
+	/** 按模型 id 保存的声明思考档位；旧缓存没有此字段，启动时沿用保守默认值。 */
+	advertisedThinking?: Record<string, AdvertisedThinking>;
+}
+
+/** 一次发现的结果：注册用的模型配置，以及写入缓存的声明思考档位。 */
+interface DiscoveredModels {
+	models: ProviderModelConfig[];
+	advertisedThinking: Record<string, AdvertisedThinking>;
 }
 
 interface CacheFile {
@@ -172,7 +196,7 @@ async function readCache(notices: Notice[]): Promise<CacheFile> {
 /** 发现成功后持久化模型列表；写失败仅警告（不影响本次注册） */
 async function persistCachedModels(
 	entry: DiscoveryProviderEntry,
-	models: ProviderModelConfig[],
+	discovered: DiscoveredModels,
 	notices: Notice[],
 ): Promise<void> {
 	try {
@@ -180,7 +204,8 @@ async function persistCachedModels(
 		cache.providers[entry.id] = {
 			fingerprint: providerFingerprint(entry),
 			fetchedAt: new Date().toISOString(),
-			models,
+			models: discovered.models,
+			advertisedThinking: discovered.advertisedThinking,
 		};
 		await mkdir(dirname(cachePath()), { recursive: true });
 		await writeFile(cachePath(), `${JSON.stringify(cache, null, 2)}\n`, "utf-8");
@@ -301,15 +326,56 @@ function asRecord(value: unknown): Record<string, unknown> {
 	return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
-/** 扩展专用的推理默认值从 compat 提取，不作为请求兼容字段转发。 */
-function modelThinking(providerCompat: Record<string, unknown> | undefined, discoveredReasoning?: boolean) {
-	const { reasoning, thinkingLevelMap, ...compat } = providerCompat ?? {};
+/** 推导思考档位只需要 provider 的 api 与 compat。 */
+type ThinkingProvider = Pick<DiscoveryProviderEntry, "api" | "compat">;
+
+/**
+ * Pi 把各档位发给后端的 effort 值；只覆盖确认会发送 effort 字符串的请求路径，其余返回 undefined，不解读 effort 声明。
+ * anthropic-messages 仅在 forceAdaptiveThinking 时发送 output_config.effort（minimal 与 low 都发 "low"），
+ * 否则走预算式思考；OpenAI 的 reasoning.effort / reasoning_effort 原样发送档位名。
+ */
+function backendEffort(api: string | undefined, compat: Record<string, unknown>): ((level: EffortLevel) => string) | undefined {
+	switch (api) {
+		case "anthropic-messages":
+			return compat.forceAdaptiveThinking === true ? (level) => (level === "minimal" ? "low" : level) : undefined;
+		case "openai-responses":
+			return (level) => level;
+		case "openai-completions":
+			return (compat.thinkingFormat ?? "openai") === "openai" && compat.supportsReasoningEffort !== false
+				? (level) => level
+				: undefined;
+		default:
+			return undefined;
+	}
+}
+
+/** 档位对应的后端值显式支持时映射到该值，显式不支持时置 null；未声明的留给默认值。 */
+function effortThinkingLevelMap(effort: AdvertisedThinking["effort"], toBackend: ((level: EffortLevel) => string) | undefined): ThinkingLevelMap {
+	const map: ThinkingLevelMap = {};
+	if (!effort || !toBackend) return map;
+	for (const level of EFFORT_LEVELS) {
+		const value = toBackend(level);
+		const supported = effort[value as EffortLevel];
+		if (supported !== undefined) map[level] = supported ? value : null;
+	}
+	return map;
+}
+
+/**
+ * 扩展专用的推理默认值从 compat 提取，不作为请求兼容字段转发。
+ * 档位映射逐项叠加：xhigh/max 默认隐藏 < effort 推导 < 模型显式映射 < provider compat.thinkingLevelMap；
+ * Pi 之后再叠加 models.json 的 modelOverrides。
+ */
+function modelThinking(provider: ThinkingProvider | undefined, discoveredReasoning?: boolean, advertised?: AdvertisedThinking) {
+	const { reasoning, thinkingLevelMap, ...compat } = provider?.compat ?? {};
 	return {
 		reasoning: typeof reasoning === "boolean" ? reasoning : (discoveredReasoning ?? true),
 		thinkingLevelMap: {
 			xhigh: null,
 			max: null,
-			...(asRecord(thinkingLevelMap) as ProviderModelConfig["thinkingLevelMap"]),
+			...effortThinkingLevelMap(advertised?.effort, backendEffort(provider?.api, compat)),
+			...advertised?.thinkingLevelMap,
+			...(asRecord(thinkingLevelMap) as ThinkingLevelMap),
 		},
 		compat: { supportsDeveloperRole: false, ...compat },
 	};
@@ -317,6 +383,36 @@ function modelThinking(providerCompat: Record<string, unknown> | undefined, disc
 
 function nonEmptyString(...values: unknown[]): string | undefined {
 	return values.find((value): value is string => typeof value === "string" && value.trim().length > 0);
+}
+
+/** 只保留 Pi 已知档位的非空字符串或 null；没有有效项时视为未声明。 */
+function validThinkingLevelMap(value: unknown): ThinkingLevelMap | undefined {
+	const raw = asRecord(value);
+	const map: ThinkingLevelMap = {};
+	for (const level of THINKING_LEVELS) {
+		const mapped = raw[level];
+		if (mapped === null || nonEmptyString(mapped)) map[level] = mapped as string | null;
+	}
+	return Object.keys(map).length > 0 ? map : undefined;
+}
+
+/** effort 整体声明不支持时不推导任何档位；逐值只接受布尔或 { supported: 布尔 }。 */
+function effortSupport(value: unknown): AdvertisedThinking["effort"] {
+	if (capabilitySupported(value) === false) return undefined;
+	const raw = asRecord(value);
+	const support: AdvertisedThinking["effort"] = {};
+	for (const level of EFFORT_LEVELS) {
+		const supported = capabilitySupported(raw[level]);
+		if (supported !== undefined) support[level] = supported;
+	}
+	return Object.keys(support).length > 0 ? support : undefined;
+}
+
+/** 显式映射取第一个含有效项的别名；模型列表与缓存共用同一套校验。 */
+function advertisedThinking(maps: unknown[], effort: unknown): AdvertisedThinking | undefined {
+	const thinkingLevelMap = maps.map(validThinkingLevelMap).find((map) => map !== undefined);
+	const effortLevels = effortSupport(effort);
+	return thinkingLevelMap || effortLevels ? { thinkingLevelMap, effort: effortLevels } : undefined;
 }
 
 function positiveTokenLimit(...values: unknown[]): number | undefined {
@@ -356,6 +452,7 @@ function canonicalizeModel(value: unknown): ModelMetadata | undefined {
 		reasoning: capabilitySupported(raw.reasoning)
 			?? capabilitySupported(capabilities.reasoning)
 			?? capabilitySupported(capabilities.thinking),
+		thinking: advertisedThinking([raw.thinkingLevelMap, raw.thinking_level_map], capabilities.effort),
 		cost: {
 			input: nonNegativeCost(cost.input, pricing.input_per_million),
 			output: nonNegativeCost(cost.output, pricing.output_per_million),
@@ -365,11 +462,11 @@ function canonicalizeModel(value: unknown): ModelMetadata | undefined {
 	};
 }
 
-export function buildModel(model: ModelMetadata, providerCompat?: Record<string, unknown>): ProviderModelConfig {
+export function buildModel(model: ModelMetadata, provider?: ThinkingProvider): ProviderModelConfig {
 	return {
 		id: model.id,
 		name: model.name ?? model.id,
-		...modelThinking(providerCompat, model.reasoning),
+		...modelThinking(provider, model.reasoning, model.thinking),
 		input: model.input ?? ["text", "image"],
 		cost: {
 			input: model.cost?.input ?? 0,
@@ -391,7 +488,7 @@ function getModelsUrl(entry: DiscoveryProviderEntry): string {
 async function fetchModels(
 	entry: DiscoveryProviderEntry,
 	notices: Notice[],
-): Promise<ProviderModelConfig[]> {
+): Promise<DiscoveredModels> {
 	if (!entry.baseUrl) {
 		throw new Error(i18n.t("missingBaseUrl"));
 	}
@@ -428,21 +525,23 @@ async function fetchModels(
 	}
 	const payload: unknown = await response.json();
 	const entries = Array.isArray(payload) ? payload : asRecord(payload).data;
-	const models = (Array.isArray(entries) ? entries : [])
-		.map(canonicalizeModel)
-		.filter((model) => model !== undefined)
-		.map((model) => buildModel(model, entry.compat));
-	if (models.length === 0) {
+	const discovered: DiscoveredModels = { models: [], advertisedThinking: {} };
+	for (const model of (Array.isArray(entries) ? entries : []).map(canonicalizeModel)) {
+		if (!model) continue;
+		discovered.models.push(buildModel(model, entry));
+		if (model.thinking) discovered.advertisedThinking[model.id] = model.thinking;
+	}
+	if (discovered.models.length === 0) {
 		throw new Error(i18n.t("emptyModelList", { url }));
 	}
-	return models;
+	return discovered;
 }
 
-/** 缓存的是含 compat 的模型配置，只有 URL+apiKey+headers+compat 相同才可复用。 */
-type FetchCache = Map<string, Promise<ProviderModelConfig[]>>;
+/** 缓存的是按 api 与 compat 构建的模型配置，只有 URL+api+apiKey+headers+compat 相同才可复用。 */
+type FetchCache = Map<string, Promise<DiscoveredModels>>;
 
-function fetchWithCache(cache: FetchCache, entry: DiscoveryProviderEntry, notices: Notice[]): Promise<ProviderModelConfig[]> {
-	const cacheKey = JSON.stringify([getModelsUrl(entry), entry.apiKey ?? "", entry.headers ?? {}, entry.compat ?? {}]);
+function fetchWithCache(cache: FetchCache, entry: DiscoveryProviderEntry, notices: Notice[]): Promise<DiscoveredModels> {
+	const cacheKey = JSON.stringify([getModelsUrl(entry), entry.api ?? "", entry.apiKey ?? "", entry.headers ?? {}, entry.compat ?? {}]);
 	let pending = cache.get(cacheKey);
 	if (!pending) {
 		pending = fetchModels(entry, notices);
@@ -469,9 +568,9 @@ function createRefreshModels(entry: DiscoveryProviderEntry, notices: Notice[], s
 			return state.lastModels;
 		}
 		const refreshed = await fetchModels(entry, notices);
-		state.lastModels = refreshed;
+		state.lastModels = refreshed.models;
 		await persistCachedModels(entry, refreshed, notices);
-		return refreshed;
+		return refreshed.models;
 	};
 }
 
@@ -505,7 +604,8 @@ async function discoverAndRegister(
 	const state: LastModelsState = { lastModels: [] };
 	const refreshModels = createRefreshModels(entry, notices, state);
 	try {
-		const models = await fetchWithCache(fetchCache, entry, notices);
+		const discovered = await fetchWithCache(fetchCache, entry, notices);
+		const { models } = discovered;
 		state.lastModels = models;
 		pi.registerProvider(entry.id, {
 			baseUrl: entry.baseUrl,
@@ -513,7 +613,7 @@ async function discoverAndRegister(
 			models,
 			refreshModels,
 		});
-		await persistCachedModels(entry, models, notices);
+		await persistCachedModels(entry, discovered, notices);
 		return { count: models.length, models };
 	} catch (err) {
 		const reason = err instanceof Error ? err.message : String(err);
@@ -534,15 +634,23 @@ async function discoverAndRegister(
 function registerFromCache(
 	pi: ExtensionAPI,
 	entry: DiscoveryProviderEntry,
-	models: ProviderModelConfig[],
+	cached: CachedProviderEntry,
 	notices: Notice[],
 ): void {
 	if (!validateEntry(entry, notices)) return;
-	// 旧缓存含硬编码的 xhigh/max，启动时按当前 provider 配置重建，保持离线可用。
-	models = models.map((model) => ({
-		...model,
-		...modelThinking(entry.compat, typeof model?.reasoning === "boolean" ? model.reasoning : undefined),
-	}));
+	// 旧缓存含硬编码的 xhigh/max，不读缓存里合并后的映射：按当前 provider 配置与重新校验的声明重建，保持离线可用。
+	const advertised = asRecord(cached.advertisedThinking);
+	const models = cached.models.map((model) => {
+		const thinking = asRecord(advertised[model?.id]);
+		return {
+			...model,
+			...modelThinking(
+				entry,
+				typeof model?.reasoning === "boolean" ? model.reasoning : undefined,
+				advertisedThinking([thinking.thinkingLevelMap], thinking.effort),
+			),
+		};
+	});
 	const state: LastModelsState = { lastModels: models };
 	const refreshModels = createRefreshModels(entry, notices, state);
 	pi.registerProvider(entry.id, {
@@ -651,7 +759,7 @@ async function reloadProvider(options: {
 		Array.isArray(cached.models) &&
 		cached.models.length > 0
 	) {
-		registerFromCache(pi, entry, cached.models, notices);
+		registerFromCache(pi, entry, cached, notices);
 		return;
 	}
 	await discoverAndRegister(pi, entry, fetchCache, notices);
@@ -898,7 +1006,7 @@ export default async function (pi: ExtensionAPI) {
 				Array.isArray(cached.models) &&
 				cached.models.length > 0
 			) {
-				registerFromCache(pi, entry, cached.models, pendingNotices);
+				registerFromCache(pi, entry, cached, pendingNotices);
 			} else {
 				await discoverAndRegister(pi, entry, fetchCache, pendingNotices);
 				// 启动期缓存未命中时保持静默，不打印模型列表
