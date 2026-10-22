@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { ModelRegistry, ModelRuntime, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { Api, Model, ModelThinkingLevel, SimpleStreamOptions, ThinkingLevel } from "@earendil-works/pi-ai";
-import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import { streamSimple as anthropicStream } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { streamSimple as completionsStream } from "@earendil-works/pi-ai/api/openai-completions";
 import { streamSimple as responsesStream } from "@earendil-works/pi-ai/api/openai-responses";
@@ -448,12 +448,15 @@ test("cached startup ignores non-boolean reasoning values", async (t) => {
 	assert.equal(h.requests.length, 0);
 });
 
-/** 用 Pi 真实的模型注册表组合扩展注册结果与 models.json（含 modelOverrides）。 */
+/**
+ * 用 Pi 真实的模型注册表组合扩展注册结果与 models.json（含 modelOverrides）。
+ * 凭据与模型存储放在内存里：registerProvider 会在后台刷新并写存储文件，落盘会与测试清理临时目录竞争（ENOTEMPTY）。
+ */
 async function piRegistry(h: { dir: string; registrations: Map<string, Parameters<ExtensionAPI["registerProvider"]>[1]> }) {
 	const runtime = await ModelRuntime.create({
-		authPath: join(h.dir, "auth.json"),
+		credentials: new InMemoryCredentialStore(),
 		modelsPath: join(h.dir, "models.json"),
-		modelsStorePath: join(h.dir, "models-store.json"),
+		modelsStore: new InMemoryModelsStore(),
 		refreshOnCreate: false,
 	});
 	const registry = new ModelRegistry(runtime);
