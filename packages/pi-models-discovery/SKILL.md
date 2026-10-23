@@ -26,7 +26,7 @@ description: "配置与排查 models.json 的动态模型发现、缓存刷新�
 
 ## 共享列表
 
-路由可正常聊天但 `/models` 为空时，可显式把 `modelsUrl` 指向同网关的共享模型列表，并用区分大小写的 `modelIdPrefix` 限定模型系列。前缀留空不过滤；模型 ID 保持原样，聊天仍使用 provider 的 `baseUrl` 和 `api`。不要把其他协议的所有模型注册到此路由；用 `/model_test provider/model` 验证实际可用性。
+路由可正常聊天但 `/models` 为空时，可显式把 `modelsUrl` 指向同网关的共享模型列表，并用区分大小写的 JavaScript 正则源码 `modelIdRegex`（如 `^claude-` 或 `^(claude-|gpt-)`）限定模型。不加 `/.../` 分隔符或标志，留空不过滤，`^`/`$` 限定匹配位置；JSON 中反斜杠须转义。无效正则走匹配缓存/手写回退，面板拒绝保存；旧 `modelIdPrefix` 按字面前缀兼容读取，面板编辑后转为新字段。模型 ID 保持原样，聊天仍使用 provider 的 `baseUrl` 和 `api`。不要把其他协议的所有模型注册到此路由；用 `/model_test provider/model` 验证实际可用性。
 
 ## 思考等级
 

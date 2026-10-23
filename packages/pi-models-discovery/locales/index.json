@@ -391,12 +391,16 @@
     "zh-CN": "模型测试完成：{passed} 个通过，已测试 {tested}/{total} 个",
     "en-US": "Model test finished: {passed} passed; {tested}/{total} tested"
   },
-  "panelLabelModelIdPrefix": {
-    "zh-CN": "模型 ID 前缀",
-    "en-US": "Model ID prefix"
+  "panelLabelModelIdRegex": {
+    "zh-CN": "模型 ID 正则",
+    "en-US": "Model ID regex"
   },
-  "panelDescModelIdPrefix": {
-    "zh-CN": "只发现 ID 以此前缀开头的模型（区分大小写）；留空不过滤。适用于共享模型列表的多个协议路由。",
-    "en-US": "Discover only model IDs beginning with this case-sensitive prefix; empty keeps all IDs. Useful for protocol routes sharing a model list."
+  "panelDescModelIdRegex": {
+    "zh-CN": "区分大小写的 JavaScript 正则表达式，如 ^claude-；不加 / 分隔符或标志，留空不过滤。",
+    "en-US": "Case-sensitive JavaScript regex source, e.g. ^claude-; no / delimiters or flags. Empty keeps all IDs."
+  },
+  "invalidModelIdRegex": {
+    "zh-CN": "modelIdRegex 正则表达式无效（{reason}）",
+    "en-US": "Invalid modelIdRegex pattern ({reason})"
   }
 }

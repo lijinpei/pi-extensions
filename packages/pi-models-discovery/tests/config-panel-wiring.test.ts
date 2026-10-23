@@ -132,9 +132,12 @@ test("metadata settings apply immediately and rediscovery reloads catalog and en
 	await discovery(pi);
 	assert.equal(registrations.get("demo")!.models![0].contextWindow, 1_000_000);
 	const command = commands.get("config:model-discovery")!;
+	const notices: Array<{ message: string; level: string }> = [];
 	const runPanel = async (scripts: string[][]) => {
 		const ui = createScriptedUi(scripts);
-		await command.handler("", { hasUI: true, ui: { custom: ui.custom, notify: () => undefined, confirm: async () => false } });
+		await command.handler("", { hasUI: true, ui: {
+			custom: ui.custom, notify: (message: string, level: string) => notices.push({ message, level }), confirm: async () => false,
+		} });
 	};
 	await runPanel([[ENTER], [...down(5), ENTER, metadataUrl, ENTER, "\u001B"]]);
 	assert.equal(registrations.get("demo")!.models![0].contextWindow, 128_000, "new source takes effect immediately");
@@ -159,10 +162,61 @@ test("metadata settings apply immediately and rediscovery reloads catalog and en
 	await runPanel([[ENTER], [...down(1), " ", "\u001B"]]);
 	assert.equal(JSON.parse(await readFile(modelsPath, "utf8")).providers.demo.refreshOnStartup, false);
 	assert.equal(requests.length, beforeToggle, "changing the startup policy must not discard an otherwise valid cache");
-	await runPanel([[ENTER], [...down(9), ENTER, "known", ENTER, "\u001B"]]);
-	assert.equal(JSON.parse(await readFile(modelsPath, "utf8")).providers.demo.modelIdPrefix, "known");
-	assert.deepEqual(registrations.get("demo")!.models!.map((model) => model.id), ["known"], "prefix filtering applies immediately");
+	await runPanel([[ENTER], [...down(9), ENTER, "^known$", ENTER, "\u001B"]]);
+	assert.equal(JSON.parse(await readFile(modelsPath, "utf8")).providers.demo.modelIdRegex, "^known$");
+	assert.deepEqual(registrations.get("demo")!.models!.map((model) => model.id), ["known"], "regex filtering applies immediately");
+	const beforeInvalid = await readFile(modelsPath, "utf8");
+	const beforeInvalidRequests = requests.length;
+	await runPanel([[ENTER], [...down(9), ENTER, "\u0001", "\u000B", "[", ENTER, "\u001B"]]);
+	assert.equal(await readFile(modelsPath, "utf8"), beforeInvalid, "invalid regex must not be written");
+	assert.equal(requests.length, beforeInvalidRequests);
+	assert.deepEqual(registrations.get("demo")!.models!.map((model) => model.id), ["known"]);
+	assert.ok(notices.some((notice) => notice.level === "warning" && notice.message.includes("modelIdRegex")));
 	await runPanel([[ENTER], [...down(9), ENTER, "\u0001", "\u000B", ENTER, "\u001B"]]);
-	assert.equal(JSON.parse(await readFile(modelsPath, "utf8")).providers.demo.modelIdPrefix, undefined);
+	assert.equal(JSON.parse(await readFile(modelsPath, "utf8")).providers.demo.modelIdRegex, undefined);
 	assert.deepEqual(registrations.get("demo")!.models!.map((model) => model.id), ["known", "other"]);
+});
+
+test("editing a legacy prefix in the panel migrates it to an escaped regex and clearing it does not restore the prefix", async (t) => {
+	initTheme("dark");
+	const agentDir = await mkdtemp(join(tmpdir(), "pi-models-discovery-prefix-migration-"));
+	const previousDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	t.after(async () => {
+		if (previousDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousDir;
+		await rm(agentDir, { recursive: true, force: true });
+	});
+	t.mock.method(globalThis, "fetch", async () => Response.json({ data: [{ id: "model.v2" }, { id: "modelXv2" }] }));
+	const modelsPath = join(agentDir, "models.json");
+	await writeFile(modelsPath, JSON.stringify({ providers: { demo: {
+		baseUrl: "https://api.example.com/v1", api: "openai-completions", apiKey: "test-key", discoverModels: true,
+		modelIdPrefix: "model.", headers: { "X-Test": "test" }, models: [{ id: "static-model" }],
+	} } }));
+	const commands = new Map<string, RegisteredCommand>();
+	const registrations = new Map<string, Parameters<ExtensionAPI["registerProvider"]>[1]>();
+	const pi = {
+		registerCommand: (name: string, command: RegisteredCommand) => commands.set(name, command),
+		registerProvider: (id: string, config: Parameters<ExtensionAPI["registerProvider"]>[1]) => registrations.set(id, config),
+		registerEntryRenderer: () => undefined, on: () => undefined,
+	} as unknown as ExtensionAPI;
+	const { default: discovery } = await import("../src/index.ts");
+	await discovery(pi);
+	const runPanel = async (keys: string[]) => {
+		const ui = createScriptedUi([[ENTER], keys]);
+		await commands.get("config:model-discovery")!.handler("", { hasUI: true, ui: { custom: ui.custom, notify: () => undefined } });
+	};
+	await runPanel([...down(9), ENTER, ENTER, "\u001B"]);
+	const saved = JSON.parse(await readFile(modelsPath, "utf8")).providers.demo;
+	assert.equal(saved.modelIdRegex, "^model\\.");
+	assert.equal(saved.modelIdPrefix, undefined);
+	assert.equal(saved.apiKey, "test-key");
+	assert.deepEqual(saved.headers, { "X-Test": "test" });
+	assert.deepEqual(saved.models, [{ id: "static-model" }]);
+	assert.deepEqual(registrations.get("demo")!.models!.map((model) => model.id), ["model.v2"]);
+	await runPanel([...down(9), ENTER, "\u0001", "\u000B", ENTER, "\u001B"]);
+	const cleared = JSON.parse(await readFile(modelsPath, "utf8")).providers.demo;
+	assert.equal(cleared.modelIdRegex, undefined);
+	assert.equal(cleared.modelIdPrefix, undefined);
+	assert.deepEqual(registrations.get("demo")!.models!.map((model) => model.id), ["model.v2", "modelXv2"]);
 });

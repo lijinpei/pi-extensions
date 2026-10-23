@@ -948,8 +948,8 @@ test("shared model lists can be filtered independently while preserving each rou
 	const modelsUrl = "https://catalog.example.com/shared/models";
 	const baseUrl = "https://api.example.com/anthropic";
 	await h.configure({
-		messages: { ...discoveryProvider, baseUrl, modelsUrl, modelIdPrefix: "chat-", api: "anthropic-messages", apiKey: "test-key" },
-		other: { ...discoveryProvider, modelsUrl, modelIdPrefix: "other-" },
+		messages: { ...discoveryProvider, baseUrl, modelsUrl, modelIdRegex: "^chat-", api: "anthropic-messages", apiKey: "test-key" },
+		other: { ...discoveryProvider, modelsUrl, modelIdRegex: "^other-" },
 	});
 	await h.start();
 	assert.deepEqual(h.registrations.get("messages")!.models!.map((model) => model.id), ["chat-one", "chat-two"]);
@@ -968,10 +968,10 @@ test("shared model lists can be filtered independently while preserving each rou
 	assert.equal(h.requests.at(-1)!.url, modelsUrl, "refresh uses the shared catalog URL");
 });
 
-test("changing or clearing a model ID prefix invalidates cache without leaking previously excluded models", async (t) => {
+test("changing or clearing a model ID regex invalidates cache without leaking previously excluded models", async (t) => {
 	const h = await discoveryHarness(t, [{ id: "one-model" }, { id: "two-model" }]);
-	for (const [prefix, expected] of [["one-", ["one-model"]], ["two-", ["two-model"]], ["", ["one-model", "two-model"]]] as const) {
-		await h.configure({ route: { ...discoveryProvider, modelIdPrefix: prefix } });
+	for (const [regex, expected] of [["^one-", ["one-model"]], ["^two-", ["two-model"]], ["", ["one-model", "two-model"]]] as const) {
+		await h.configure({ route: { ...discoveryProvider, modelIdRegex: regex } });
 		const before = h.requests.length;
 		await h.start();
 		assert.equal(h.requests.length, before + 1);
@@ -979,8 +979,70 @@ test("changing or clearing a model ID prefix invalidates cache without leaking p
 		await h.start();
 		assert.equal(h.requests.length, before + 1);
 	}
-	await h.configure({ route: { ...discoveryProvider, modelIdPrefix: "missing-", metadataUrl } });
+	await h.configure({ route: { ...discoveryProvider, modelIdRegex: "^missing-", metadataUrl } });
 	await h.start();
 	assert.equal(h.registrations.get("route")!.models, undefined, "empty filtered lists use static fallback");
 	assert.ok(!h.requests.some((request) => request.url === metadataUrl), "catalog cannot establish route availability");
+});
+
+test("model ID regex supports anchors, alternation, escaping and substring matching without changing IDs", async (t) => {
+	const h = await discoveryHarness(t, [
+		{ id: "chat-one" }, { id: "chat-two" }, { id: "vendor/chat-one" }, { id: "chat-one-extra" },
+		{ id: "CHAT-one" }, { id: "model.v2" }, { id: "modelXv2" }, { id: "other-one" },
+		{ id: "chat-embedding", mode: "embedding" },
+	]);
+	await h.configure({
+		exact: { ...discoveryProvider, modelIdRegex: "^(chat-(one|two)|other-one)$" },
+		substring: { ...discoveryProvider, modelIdRegex: "chat-one" },
+		escaped: { ...discoveryProvider, modelIdRegex: "^model\\.v[0-9]+$" },
+		all: discoveryProvider,
+	});
+	await h.start();
+	assert.deepEqual(h.registrations.get("exact")!.models!.map((model) => model.id), ["chat-one", "chat-two", "other-one"]);
+	assert.deepEqual(h.registrations.get("substring")!.models!.map((model) => model.id), ["chat-one", "vendor/chat-one", "chat-one-extra"]);
+	assert.deepEqual(h.registrations.get("escaped")!.models!.map((model) => model.id), ["model.v2"]);
+	assert.equal(h.registrations.get("all")!.models!.length, 8);
+	assert.equal(h.requests.length, 4, "same URL with different patterns must keep results isolated");
+});
+
+test("legacy prefixes stay literal and an explicit regex takes precedence even when empty", async (t) => {
+	const h = await discoveryHarness(t, [{ id: "model.v2" }, { id: "modelXv2" }, { id: "other" }]);
+	await h.configure({
+		legacy: { ...discoveryProvider, modelIdPrefix: "model." },
+		explicit: { ...discoveryProvider, modelIdPrefix: "model.", modelIdRegex: "^other$" },
+		cleared: { ...discoveryProvider, modelIdPrefix: "model.", modelIdRegex: "" },
+	});
+	const cacheDir = join(h.dir, "extensions", "pi-models-discovery");
+	await mkdir(cacheDir, { recursive: true });
+	await writeFile(join(cacheDir, "cache.json"), JSON.stringify({ version: 1, providers: { legacy: {
+		fingerprint: JSON.stringify([discoveryProvider.baseUrl, discoveryProvider.api, "", {}, {}, { modelIdPrefix: "model." }]),
+		fetchedAt: "2026-01-01T00:00:00.000Z", models: [buildModel({ id: "model.v1" })],
+	} } }));
+	await h.start();
+	assert.deepEqual(h.registrations.get("legacy")!.models!.map((model) => model.id), ["model.v2"]);
+	assert.deepEqual(h.registrations.get("explicit")!.models!.map((model) => model.id), ["other"]);
+	assert.deepEqual(h.registrations.get("cleared")!.models!.map((model) => model.id), ["model.v2", "modelXv2", "other"]);
+	assert.equal(h.requests.length, 3, "old prefix fingerprints refresh once after conversion");
+	await h.configure({ legacy: { ...discoveryProvider, modelIdRegex: "^model\\." } });
+	await h.start();
+	assert.equal(h.requests.length, 3, "saving the equivalent regex keeps the refreshed cache");
+});
+
+test("an invalid model ID regex warns and preserves static fallback without fetching or reusing a different filter's cache", async (t) => {
+	const h = await discoveryHarness(t, [{ id: "one-model" }, { id: "two-model" }]);
+	await h.configure({ route: { ...discoveryProvider, modelIdRegex: "^one-" } });
+	await h.start();
+	assert.equal(h.registrations.get("route")!.models![0].id, "one-model");
+	await h.configure({
+		route: { ...discoveryProvider, modelIdRegex: "[", models: [{ id: "handwritten" }] },
+		healthy: { ...discoveryProvider, modelIdRegex: "^two-" },
+	});
+	await h.start();
+	assert.equal(h.requests.length, 2, "invalid patterns must not fetch an unfiltered list");
+	assert.equal(h.registrations.get("route")!.models, undefined, "keep the models.json fallback");
+	assert.equal(h.registrations.get("healthy")!.models![0].id, "two-model");
+	assert.ok(h.warnings().some((message) => message.includes("route") && message.includes("modelIdRegex")));
+	await assert.rejects(() => h.registrations.get("route")!.refreshModels!(refreshContext(false)));
+	await assert.rejects(() => h.registrations.get("route")!.refreshModels!(refreshContext(true)), /modelIdRegex/);
+	assert.equal(h.requests.length, 2);
 });

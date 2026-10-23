@@ -8,7 +8,7 @@
       "metadataUrl": "https://models.dev/api.json",
       "metadataProvider": "anthropic",
       "refreshOnStartup": true,
-      "modelIdPrefix": ""
+      "modelIdRegex": ""
     }
   }
 }

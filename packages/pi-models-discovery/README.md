@@ -64,7 +64,7 @@ Hand edits require `/reload` to take effect; changes made through `/config:model
 
 ### Shared model lists
 
-Some gateways expose a model list through one protocol route while another route accepts inference but returns an empty list. Set `modelsUrl` to the shared list and `modelIdPrefix` to a case-sensitive prefix to select the intended family:
+Some gateways expose a model list through one protocol route while another route accepts inference but returns an empty list. Set `modelsUrl` to the shared list and `modelIdRegex` to a case-sensitive JavaScript regular expression to select the intended models:
 
 ```json
 {
@@ -72,7 +72,7 @@ Some gateways expose a model list through one protocol route while another route
     "messages-gateway": {
       "baseUrl": "https://api.example.com/anthropic",
       "modelsUrl": "https://api.example.com/openai/models",
-      "modelIdPrefix": "claude-",
+      "modelIdRegex": "^claude-",
       "api": "anthropic-messages",
       "discoverModels": true,
       "metadataUrl": "https://models.dev/api.json",
@@ -82,7 +82,11 @@ Some gateways expose a model list through one protocol route while another route
 }
 ```
 
-The prefix is optional; empty or omitted keeps all conversational models. Matching preserves the endpoint's exact ID. Prefix changes invalidate the model cache and take effect immediately in the settings panel. A filtered empty list uses the normal cache/static fallback. The list URL does not change the inference URL or protocol. A shared list advertises models for the gateway; test a model with `/model_test` to confirm that it works on the selected route.
+The regex is optional; empty or omitted keeps all conversational models. Supply a JavaScript regex source without `/.../` delimiters or flags. Matching is case-sensitive and can occur anywhere in the ID; use `^` and `$` for anchors, for example `^claude-` or `^(claude-|gpt-)`. Escape backslashes in JSON: `"^model\\.v[0-9]+$"` matches IDs such as `model.v2`. Matching preserves the endpoint's exact ID, including case and whitespace.
+
+Regex changes invalidate the model cache and take effect immediately in the settings panel. Invalid patterns are rejected by the panel; invalid file settings and filtered empty lists use the normal matching-cache/static fallback. The list URL does not change the inference URL or protocol. A shared list advertises models for the gateway; test a model with `/model_test` to confirm that it works on the selected route.
+
+Existing `modelIdPrefix` settings are still read as literal prefixes and converted to escaped, anchored regexes. An explicit `modelIdRegex` takes precedence, including an empty string to disable filtering. Editing a provider in the settings panel saves the new field and removes `modelIdPrefix`; the first discovery after conversion refreshes the cache.
 
 ### Optional canonical metadata
 
@@ -154,7 +158,7 @@ Tests make real requests and may incur gateway charges. Discovery itself only re
 
 ## Behavior
 
-- **Startup**: register matching cached models, then refresh the endpoint list and configured metadata catalog. Set provider `refreshOnStartup: false` to skip the startup network refresh when cached models exist. The model cache lives at `~/.pi/agent/extensions/pi-models-discovery/cache.json`. The cache is invalidated automatically when the provider configuration fingerprint (baseUrl+api+apiKey+headers+compat+modelsUrl+modelIdPrefix+metadataUrl+metadataProvider) changes, triggering a fresh network discovery.
+- **Startup**: register matching cached models, then refresh the endpoint list and configured metadata catalog. Set provider `refreshOnStartup: false` to skip the startup network refresh when cached models exist. The model cache lives at `~/.pi/agent/extensions/pi-models-discovery/cache.json`. The cache is invalidated automatically when the provider configuration fingerprint (baseUrl+api+apiKey+headers+compat+modelsUrl+modelIdRegex+metadataUrl+metadataProvider) changes, triggering a fresh network discovery.
 - **Online refresh**: `/config:model-discovery-refresh`, or the `refreshModels` hook triggered when opening `/model`, rediscovers online and updates the cache.
 - **Offline / fetch failure**: matching cached models are retained, or handwritten `models` in models.json (if any) are kept as a fallback, and an explicit warning is surfaced via in-session notify — never a silent degradation. One provider failing does not affect the others.
 - **apiKey resolution** (discovery request only): supports literals and `$ENV_VAR` / `${ENV_VAR}` interpolation; `!command` values skip discovery with an explicit warning (chat requests are still resolved by pi itself and are unaffected).

@@ -64,7 +64,7 @@ pi install npm:pi-models-discovery
 
 ### 共用模型列表
 
-部分网关只在一种协议路由返回模型列表，另一种路由能聊天但列表为空。可将 `modelsUrl` 指向共享列表，并设置区分大小写的 `modelIdPrefix`，仅发现所需模型系列：
+部分网关只在一种协议路由返回模型列表，另一种路由能聊天但列表为空。可将 `modelsUrl` 指向共享列表，并设置区分大小写的 JavaScript 正则表达式 `modelIdRegex`，仅发现所需模型：
 
 ```json
 {
@@ -72,7 +72,7 @@ pi install npm:pi-models-discovery
     "messages-gateway": {
       "baseUrl": "https://api.example.com/anthropic",
       "modelsUrl": "https://api.example.com/openai/models",
-      "modelIdPrefix": "claude-",
+      "modelIdRegex": "^claude-",
       "api": "anthropic-messages",
       "discoverModels": true,
       "metadataUrl": "https://models.dev/api.json",
@@ -82,7 +82,11 @@ pi install npm:pi-models-discovery
 }
 ```
 
-前缀可选；留空或省略保留所有对话模型，匹配后仍使用端点的原始 ID。修改前缀会使模型缓存失效，设置面板修改立即生效。筛选后的列表为空时使用正常缓存/手写回退。列表 URL 不改变聊天 URL 或协议。共享列表只表示网关列出了模型，须用 `/model_test` 确认指定路由可用。
+正则可选；留空或省略保留所有对话模型。使用 JavaScript 正则源码，不加 `/.../` 分隔符或标志。匹配区分大小写，默认可匹配 ID 任意位置；用 `^`、`$` 限定位置，如 `^claude-` 或 `^(claude-|gpt-)`。JSON 中须转义反斜杠：`"^model\\.v[0-9]+$"` 匹配 `model.v2` 等 ID。匹配后仍使用端点的原始 ID，保留大小写和空白。
+
+修改正则会使模型缓存失效，设置面板修改立即生效。面板会拒绝无效正则；文件中的无效正则或筛选后的空列表使用正常的匹配缓存/手写回退。列表 URL 不改变聊天 URL 或协议。共享列表只表示网关列出了模型，须用 `/model_test` 确认指定路由可用。
+
+已有的 `modelIdPrefix` 仍按字面前缀读取，并转换为转义后的锚定正则。显式设置的 `modelIdRegex` 优先，包括用于关闭筛选的空字符串。在面板中编辑 provider 时会保存新字段并删除 `modelIdPrefix`；转换后首次发现会刷新缓存。
 
 ### 可选的标准目录元数据
 
@@ -154,7 +158,7 @@ pi install npm:pi-models-discovery
 
 ## 行为
 
-- **启动**：先注册匹配配置的模型缓存，再刷新端点列表与元数据目录。provider 设置 `refreshOnStartup: false` 后，缓存命中时跳过启动联网刷新；缓存文件位于 `~/.pi/agent/extensions/pi-models-discovery/cache.json`。provider 配置指纹（baseUrl+api+apiKey+headers+compat+modelsUrl+modelIdPrefix+metadataUrl+metadataProvider）变化时缓存自动失效，重新走网络发现。
+- **启动**：先注册匹配配置的模型缓存，再刷新端点列表与元数据目录。provider 设置 `refreshOnStartup: false` 后，缓存命中时跳过启动联网刷新；缓存文件位于 `~/.pi/agent/extensions/pi-models-discovery/cache.json`。provider 配置指纹（baseUrl+api+apiKey+headers+compat+modelsUrl+modelIdRegex+metadataUrl+metadataProvider）变化时缓存自动失效，重新走网络发现。
 - **在线刷新**：`/config:model-discovery-refresh` 或 `/model` 打开时触发的 `refreshModels` 在线重新发现，并同步更新缓存。
 - **离线 / 拉取失败**：保留匹配配置的模型缓存，否则保留 models.json 里手写的 `models`（如有，作为回退），并通过会话内 notify 显式警告，不静默降级；单个 provider 失败不影响其他 provider。
 - **apiKey 解析**（仅发现请求）：支持字面量与 `$ENV_VAR` / `${ENV_VAR}` 插值；`!command` 形式跳过发现并显式警告（聊天请求仍由 pi 自身解析执行，不受影响）。

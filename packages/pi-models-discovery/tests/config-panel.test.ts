@@ -42,7 +42,7 @@ function customProvider(): PanelProvider {
 		id: "llm-proxy",
 		baseUrl: "http://127.0.0.1:9000/pi/v1",
 		modelsUrl: "https://api.example.com/v1/models",
-		modelIdPrefix: "chat-",
+		modelIdRegex: "^chat-",
 		metadataUrl: "https://models.dev/api.json",
 		metadataProvider: "anthropic",
 		refreshOnStartup: true,
@@ -82,7 +82,7 @@ test("顶层列出每个 provider，并带「添加 provider」入口", () => {
 });
 
 test("取当前显示值写回，每个可编辑字段都能往返一致", () => {
-	for (const provider of [customProvider(), { ...customProvider(), refreshOnStartup: false, name: "", apiKey: "", modelsUrl: "", modelIdPrefix: "", metadataUrl: "", metadataProvider: "" }]) {
+	for (const provider of [customProvider(), { ...customProvider(), refreshOnStartup: false, name: "", apiKey: "", modelsUrl: "", modelIdRegex: "", metadataUrl: "", metadataProvider: "" }]) {
 		for (const item of buildProviderItems(provider)) {
 			if (item.id === PROVIDER_FIELD.rediscover || item.id === PROVIDER_FIELD.remove) continue;
 			const next = applyProviderChange(provider, item.id, item.currentValue);
@@ -93,8 +93,8 @@ test("取当前显示值写回，每个可编辑字段都能往返一致", () =>
 });
 
 test("empty text submenus return their displayed label and round-trip empty configuration values", () => {
-	const provider = { ...customProvider(), name: "", apiKey: "", modelsUrl: "", modelIdPrefix: "", metadataUrl: "", metadataProvider: "" };
-	for (const item of buildProviderItems(provider).filter((row) => ["name", "apiKey", "modelsUrl", "modelIdPrefix", "metadataUrl", "metadataProvider"].includes(row.id))) {
+	const provider = { ...customProvider(), name: "", apiKey: "", modelsUrl: "", modelIdRegex: "", metadataUrl: "", metadataProvider: "" };
+	for (const item of buildProviderItems(provider).filter((row) => ["name", "apiKey", "modelsUrl", "modelIdRegex", "metadataUrl", "metadataProvider"].includes(row.id))) {
 		let result: string | undefined;
 		const submenu = item.submenu!(item.currentValue, (value) => { result = value; });
 		press(submenu, [ENTER]);
@@ -117,6 +117,17 @@ test("开关与枚举写回的是机器值，不是本地化文案", () => {
 test("文本字段写回前去掉首尾空白", () => {
 	const next = applyProviderChange(customProvider(), PROVIDER_FIELD.baseUrl, "  https://example.test/v1  ");
 	assert.equal(next?.baseUrl, "https://example.test/v1");
+});
+
+test("regex panel values preserve significant whitespace and reject malformed patterns", () => {
+	const provider = { ...customProvider(), modelIdRegex: " chat- " };
+	const item = buildProviderItems(provider).find((row) => row.id === PROVIDER_FIELD.modelIdRegex)!;
+	let result: string | undefined;
+	const submenu = item.submenu!(item.currentValue, (value) => { result = value; });
+	press(submenu, [ENTER]);
+	assert.equal(result, provider.modelIdRegex);
+	assert.deepEqual(applyProviderChange(provider, item.id, result!), provider);
+	assert.throws(() => applyProviderChange(provider, item.id, "["), /modelIdRegex/);
 });
 
 test("未知字段或没人提供过的候选值不会改配置", () => {
