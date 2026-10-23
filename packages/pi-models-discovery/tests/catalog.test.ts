@@ -769,6 +769,140 @@ test("metadata requests are shared while provider-specific catalog matches stay 
 	assert.deepEqual([...h.registrations.values()].map((config) => config.models![0].cost.input), [1, 2, 1]);
 });
 
+test("model-picker refresh shares catalogs across slow gateways and fetches fresh metadata on each refresh", { timeout: 10_000 }, async (t) => {
+	const releaseSlow = Promise.withResolvers<void>();
+	let pendingRefresh: Promise<unknown> | undefined;
+	t.after(async () => {
+		releaseSlow.resolve();
+		await pendingRefresh;
+	});
+	const h = await discoveryHarness(t);
+	const otherMetadataUrl = `${metadataUrl}?source=other`;
+	const slowModelsUrl = "https://api.example.com/slow/models";
+	const slowStarted = Promise.withResolvers<void>();
+	const fastFinished = Promise.withResolvers<void>();
+	const requests: string[] = [];
+	let revision = 1;
+	t.mock.method(globalThis, "fetch", async (url: string) => {
+		requests.push(url);
+		if (url === metadataUrl || url === otherMetadataUrl) {
+			return Response.json({
+				one: { models: { shared: { limit: { context: revision * (url === metadataUrl ? 100_000 : 300_000) } } } },
+				two: { models: { shared: { limit: { context: revision * 200_000 } } } },
+			});
+		}
+		if (revision === 2 && url === slowModelsUrl) {
+			slowStarted.resolve();
+			await releaseSlow.promise;
+		}
+		return Response.json({ data: [{ id: "shared" }] });
+	});
+	const provider = { ...discoveryProvider, apiKey: "test-key", metadataUrl };
+	await h.configure({
+		one: provider,
+		two: { ...provider, modelsUrl: slowModelsUrl },
+		proxy: { ...provider, metadataProvider: "one" },
+		other: { ...provider, metadataUrl: otherMetadataUrl, metadataProvider: "one" },
+	});
+	await h.start();
+	const config = h.registrations.get("one")!;
+	const refreshModels = config.refreshModels!;
+	config.refreshModels = async (context) => {
+		const models = await refreshModels(context);
+		if (context.allowNetwork) fastFinished.resolve();
+		return models;
+	};
+	const registry = await piRegistry(h);
+	const ids = [...h.registrations.keys()];
+	for (revision = 2; revision <= 3; revision++) {
+		requests.length = 0;
+		const pending = registry.refresh({ allowNetwork: true, providers: ids });
+		pendingRefresh = pending;
+		if (revision === 2) {
+			await Promise.all([slowStarted.promise, fastFinished.promise]);
+			releaseSlow.resolve();
+		}
+		const result = await pending;
+		assert.equal(result.errors.size, 0);
+		assert.equal(result.aborted, false);
+		assert.equal(requests.filter((url) => url === metadataUrl).length, 1, "retain the shared catalog until slower hooks finish");
+		assert.equal(requests.filter((url) => url === otherMetadataUrl).length, 1, "different source URLs stay separate");
+		assert.deepEqual(ids.map((id) => registry.find(id, "shared")!.contextWindow),
+			[100_000, 200_000, 100_000, 300_000].map((limit) => limit * revision));
+		const saved = JSON.parse(await readFile(join(h.dir, "extensions/pi-models-discovery/metadata.json"), "utf-8"));
+		assert.equal(saved.sources[metadataUrl].providers.two.models.shared.contextWindow, 200_000 * revision);
+		assert.equal(saved.sources[otherMetadataUrl].providers.one.models.shared.contextWindow, 300_000 * revision);
+	}
+	const before = requests.length;
+	assert.equal((await registry.refresh({ allowNetwork: false, providers: ids })).errors.size, 0);
+	assert.equal(requests.length, before, "offline reads never fetch catalogs");
+});
+
+test("a repeated online hook fetches fresh metadata while an earlier gateway refresh remains pending", { timeout: 10_000 }, async (t) => {
+	const releaseSlow = Promise.withResolvers<void>();
+	let pendingSlow: Promise<unknown> | undefined;
+	t.after(async () => {
+		releaseSlow.resolve();
+		await pendingSlow;
+	});
+	const h = await discoveryHarness(t);
+	const slowUrl = "https://api.example.com/slow/models";
+	const slowStarted = Promise.withResolvers<void>();
+	let revision = 1;
+	let catalogRequests = 0;
+	t.mock.method(globalThis, "fetch", async (url: string) => {
+		if (url === metadataUrl) {
+			catalogRequests++;
+			return Response.json({ data: [{ id: "known", context_window: revision * 100_000 }] });
+		}
+		if (url === slowUrl && revision === 2) {
+			slowStarted.resolve();
+			await releaseSlow.promise;
+		}
+		return Response.json({ data: [{ id: "known" }] });
+	});
+	const provider = { ...discoveryProvider, metadataUrl };
+	await h.configure({ fast: provider, slow: { ...provider, modelsUrl: slowUrl } });
+	await h.start();
+	const fast = h.registrations.get("fast")!.refreshModels!;
+	revision = 2;
+	catalogRequests = 0;
+	const pending = h.registrations.get("slow")!.refreshModels!(refreshContext(true));
+	pendingSlow = pending;
+	await slowStarted.promise;
+	assert.equal((await fast(refreshContext(true)))[0].contextWindow, 200_000);
+	revision = 3;
+	assert.equal((await fast(refreshContext(true)))[0].contextWindow, 300_000, "a new refresh must not reuse a previous batch's settled catalog");
+	releaseSlow.resolve();
+	assert.equal((await pending)[0].contextWindow, 200_000, "the earlier batch retains its own metadata snapshot");
+	assert.equal(catalogRequests, 2);
+});
+
+test("model-picker refresh shares failed catalog lookups and retries them on the next refresh", async (t) => {
+	const h = await discoveryHarness(t);
+	let failCatalog = true;
+	let catalogRequests = 0;
+	t.mock.method(globalThis, "fetch", async (url: string) => {
+		if (url !== metadataUrl) return Response.json({ data: [{ id: "known" }] });
+		catalogRequests++;
+		return failCatalog ? new Response(null, { status: 503 }) : Response.json(canonicalCatalog());
+	});
+	const provider = { ...discoveryProvider, apiKey: "test-key", metadataUrl, metadataProvider: "origin" };
+	await h.configure({ one: provider, two: provider });
+	await h.start();
+	const registry = await piRegistry(h);
+	h.warnings();
+	for (const failure of [true, false]) {
+		failCatalog = failure;
+		catalogRequests = 0;
+		const result = await registry.refresh({ allowNetwork: true, providers: ["one", "two"] });
+		assert.equal(result.errors.size, 0, "catalog enrichment is optional when gateway discovery succeeds");
+		assert.equal(catalogRequests, 1);
+		for (const id of ["one", "two"]) assert.equal(registry.find(id, "known")!.contextWindow, failure ? 1_000_000 : 128_000);
+		assert.equal(h.warnings().length, failure ? 2 : 0);
+	}
+});
+
 test("catalog failures warn without preventing endpoint model registration and recover on refresh", async (t) => {
 	const h = await discoveryHarness(t);
 	let catalogResponse = new Response(null, { status: 503 });
@@ -863,6 +997,51 @@ test("model-picker refresh reports catalog failures immediately in the active se
 	assert.equal(h.warnings().length, 1, "refresh warnings must be delivered even after the startup queue has been flushed");
 });
 
+test("model-picker refresh reports gateway errors, retains cached models and allows other providers to refresh", async (t) => {
+	const h = await discoveryHarness(t);
+	const brokenUrl = "https://api.example.com/broken/models";
+	let failure = "";
+	let revision = 1;
+	t.mock.method(globalThis, "fetch", async (url: string) => {
+		if (url === brokenUrl) {
+			if (failure === "network") throw new Error("gateway offline");
+			if (failure === "http") return new Response(null, { status: 503 });
+			if (failure === "empty") return Response.json({ data: [] });
+		}
+		return Response.json({ data: [{ id: `model-${revision}`, context_window: revision * 100_000 }] });
+	});
+	const provider = { ...discoveryProvider, apiKey: "test-key" };
+	await h.configure({ broken: { ...provider, modelsUrl: brokenUrl }, healthy: provider });
+	await h.start();
+	const registry = await piRegistry(h);
+	const original = registry.find("broken", "model-1")!;
+	assert.ok(original);
+	const cacheFile = join(h.dir, "extensions/pi-models-discovery/cache.json");
+	const originalCache = JSON.parse(await readFile(cacheFile, "utf-8")).providers.broken;
+	assert.deepEqual(h.warnings(), []);
+	for (failure of ["network", "http", "empty"]) {
+		revision++;
+		const result = await registry.refresh({ allowNetwork: true, providers: ["broken", "healthy"] });
+		assert.equal(result.aborted, false);
+		assert.deepEqual([...result.errors.keys()], ["broken"]);
+		assert.ok(result.errors.get("broken")!.message.includes(brokenUrl));
+		assert.deepEqual(registry.find("broken", "model-1"), original, "Pi retains the last successful list when the online hook rejects");
+		assert.equal(registry.find("healthy", `model-${revision}`)!.contextWindow, revision * 100_000);
+		assert.deepEqual(JSON.parse(await readFile(cacheFile, "utf-8")).providers.broken, originalCache);
+		assert.deepEqual(await h.registrations.get("broken")!.refreshModels!(refreshContext(false)), h.registrations.get("broken")!.models);
+		const warnings = h.warnings();
+		assert.equal(warnings.length, 1);
+		assert.ok(warnings[0].includes("broken"));
+	}
+	failure = "";
+	revision++;
+	assert.equal((await registry.refresh({ allowNetwork: true, providers: ["broken", "healthy"] })).errors.size, 0);
+	assert.equal(registry.find("broken", `model-${revision}`)!.contextWindow, revision * 100_000);
+	assert.equal(registry.find("broken", "model-1"), undefined);
+	assert.equal(JSON.parse(await readFile(cacheFile, "utf-8")).providers.broken.models[0].id, `model-${revision}`);
+	assert.deepEqual(h.warnings(), []);
+});
+
 test("startup refresh defaults on, updates saved metadata and keeps cached models when the gateway fails", async (t) => {
 	const h = await discoveryHarness(t);
 	let contextWindow = 128_000;
@@ -889,7 +1068,8 @@ test("startup refresh defaults on, updates saved metadata and keeps cached model
 	await h.start();
 	const config = h.registrations.get("proxy")!;
 	assert.equal(config.models![0].contextWindow, 256_000);
-	assert.deepEqual(await config.refreshModels!(refreshContext(true)), config.models, "picker refresh failure must retain usable models");
+	await assert.rejects(() => config.refreshModels!(refreshContext(true)), /gateway offline/);
+	assert.deepEqual(await config.refreshModels!(refreshContext(false)), config.models, "offline reads retain usable models after an online failure");
 	assert.ok(h.warnings().length >= 2);
 	assert.equal(await readFile(join(h.dir, "models.json"), "utf-8"), original, "automatic refresh must not rewrite gateway configuration");
 	assert.ok(h.commands.has("model_test"));

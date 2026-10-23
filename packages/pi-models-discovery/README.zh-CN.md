@@ -120,7 +120,7 @@ pi install npm:pi-models-discovery
 
 目录请求不会携带 provider 的 API key 或 headers；独立目录 API 须允许无鉴权读取。查询失败会显示警告，并在存在时使用已保存目录；端点发现仍可使用。端点请求失败或返回空列表时，目录条目不能证明可用性，保留匹配配置的模型缓存或手写模型回退。此处可用性指端点列出了模型，发现流程不会发送计费的聊天探测请求。
 
-`modelsUrl`、`metadataUrl`、`metadataProvider` 均可在 `/config:model-discovery` 面板修改，立即生效。启动缓存保存补齐后的结果；修改元数据 URL 或 provider 会使缓存失效。启动默认自动刷新；设置 `refreshOnStartup: false` 后命中缓存时不联网，缓存缺失仍进行发现。离线注册表读取不联网，显式在线刷新重新读取两个来源。同一次启动或刷新中，多个 provider 共享目录请求，但各自的匹配结果互不混用。[config.example.json](./config.example.json) 提供可合并进 `models.json` 的完整示例。
+`modelsUrl`、`metadataUrl`、`metadataProvider` 均可在 `/config:model-discovery` 面板修改，立即生效。启动缓存保存补齐后的结果；修改元数据 URL 或 provider 会使缓存失效。启动默认自动刷新；设置 `refreshOnStartup: false` 后命中缓存时不联网，缓存缺失仍进行发现。离线注册表读取不联网，显式在线刷新重新读取两个来源。启动和 `/config:model-discovery-refresh` 中，多个 provider 共享目录请求；并发的 `/model` 刷新钩子也按目录 URL 共享一次查询和元数据文件更新，较慢网关请求尚未结束时仍可复用。下一次刷新重新获取元数据，各 provider 的匹配结果互不混用。[config.example.json](./config.example.json) 提供可合并进 `models.json` 的完整示例。
 
 ## 刷新缓存
 
@@ -159,7 +159,7 @@ pi install npm:pi-models-discovery
 ## 行为
 
 - **启动**：先注册匹配配置的模型缓存，再刷新端点列表与元数据目录。provider 设置 `refreshOnStartup: false` 后，缓存命中时跳过启动联网刷新；缓存文件位于 `~/.pi/agent/extensions/pi-models-discovery/cache.json`。provider 配置指纹（baseUrl+api+apiKey+headers+compat+modelsUrl+modelIdRegex+metadataUrl+metadataProvider）变化时缓存自动失效，重新走网络发现。
-- **在线刷新**：`/config:model-discovery-refresh` 或 `/model` 打开时触发的 `refreshModels` 在线重新发现，并同步更新缓存。
+- **在线刷新**：`/config:model-discovery-refresh` 或 `/model` 打开时触发的 `refreshModels` 在线重新发现，并同步更新缓存。网关发现失败时，钩子抛错，让 Pi 报告刷新失败并保留之前的模型列表；其他 provider 仍可正常刷新。
 - **离线 / 拉取失败**：保留匹配配置的模型缓存，否则保留 models.json 里手写的 `models`（如有，作为回退），并通过会话内 notify 显式警告，不静默降级；单个 provider 失败不影响其他 provider。
 - **apiKey 解析**（仅发现请求）：支持字面量与 `$ENV_VAR` / `${ENV_VAR}` 插值；`!command` 形式跳过发现并显式警告（聊天请求仍由 pi 自身解析执行，不受影响）。
 - 端点与配置目录都缺失元数据时，发现的模型默认参数为 `reasoning: true`、`input: ["text", "image"]`、cost 全 0、`contextWindow` 1M、`maxTokens` 64K、`compat.supportsDeveloperRole: false`。服务返回的元数据按下表替换这些默认值；provider 级 `compat` 会合并进每个发现的模型。

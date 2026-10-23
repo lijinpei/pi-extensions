@@ -35,7 +35,7 @@
  *   并通过 notify 显式警告，不静默降级；单个 provider 失败不影响其他 provider 注册。
  * - 注册 refreshModels：打开 /model 触发在线刷新时重新发现；
  *   离线初始化（allowNetwork=false）返回上次成功列表（含缓存），尚无成功记录时抛错，
- *   以免空列表清掉 models.json 手写 models。
+ *   以免空列表清掉 models.json 手写 models；在线失败抛错，由 Pi 保留离线列表并报告刷新失败。
  * - 发现模型默认隐藏 xhigh/max；端点 thinkingLevelMap / capabilities.effort 与端点或目录的 reasoning_options 可逐模型开启或隐藏档位，
  *   provider.compat.thinkingLevelMap 逐项覆盖声明，provider.compat.reasoning 可关闭推理；
  *   逐模型差异用 provider.modelOverrides 覆盖（优先级最高）。
@@ -545,11 +545,18 @@ interface LastModelsState {
 	lastModels: ProviderModelConfig[];
 }
 
+/** Concurrent hooks share catalogs; a provider joining again starts a fresh batch for its new refresh. */
+const onlineRefreshCaches = new WeakMap<ExtensionAPI, {
+	active: number;
+	providers: Set<string>;
+	metadata: FetchCache["metadata"];
+}>();
+
 /**
  * 构造 refreshModels：离线初始化返回最近成功列表（无记录则抛错，避免清空手写 models）；
  * 在线刷新强制重拉、更新最近列表并持久化缓存。
  */
-function createRefreshModels(entry: DiscoveryProviderEntry, notices: Notice[], state: LastModelsState, sink?: NoticeSink) {
+function createRefreshModels(pi: ExtensionAPI, entry: DiscoveryProviderEntry, notices: Notice[], state: LastModelsState, sink?: NoticeSink) {
 	return async (context: { allowNetwork: boolean }) => {
 		if (!context.allowNetwork) {
 			if (state.lastModels.length === 0) {
@@ -558,16 +565,23 @@ function createRefreshModels(entry: DiscoveryProviderEntry, notices: Notice[], s
 			return state.lastModels;
 		}
 		const refreshNotices: Notice[] = [];
+		let cache = onlineRefreshCaches.get(pi);
+		if (!cache || cache.providers.has(entry.id)) {
+			cache = { active: 0, providers: new Set(), metadata: new Map() };
+			onlineRefreshCaches.set(pi, cache);
+		}
+		cache.providers.add(entry.id);
+		cache.active++;
 		try {
-			const refreshed = await fetchModels(entry, refreshNotices);
+			const refreshed = await fetchModels(entry, refreshNotices, cache.metadata);
 			state.lastModels = refreshed.models;
 			await persistCachedModels(entry, refreshed, refreshNotices);
 			return refreshed.models;
 		} catch (error) {
 			refreshNotices.push({ level: "warning", message: i18n.t("discoveryFailed", { id: entry.id, reason: error instanceof Error ? error.message : String(error) }) });
-			if (state.lastModels.length > 0) return state.lastModels;
 			throw error;
 		} finally {
+			if (--cache.active === 0 && onlineRefreshCaches.get(pi) === cache) onlineRefreshCaches.delete(pi);
 			for (const notice of refreshNotices) {
 				if (sink) sink(notice);
 				else notices.push(notice);
@@ -608,7 +622,7 @@ async function discoverAndRegister(
 	cached ??= (await readCache(notices)).providers[entry.id];
 	if (cached?.fingerprint !== providerFingerprint(entry) || !Array.isArray(cached?.models) || !cached.models.length) cached = undefined;
 	const state: LastModelsState = { lastModels: [] };
-	const refreshModels = createRefreshModels(entry, notices, state, sink);
+	const refreshModels = createRefreshModels(pi, entry, notices, state, sink);
 	try {
 		const discovered = await fetchWithCache(fetchCache, entry, notices);
 		const { models } = discovered;
@@ -660,7 +674,7 @@ function registerFromCache(
 		};
 	});
 	const state: LastModelsState = { lastModels: models };
-	const refreshModels = createRefreshModels(entry, notices, state, sink);
+	const refreshModels = createRefreshModels(pi, entry, notices, state, sink);
 	pi.registerProvider(entry.id, {
 		baseUrl: entry.baseUrl,
 		api: entry.api as Api,
