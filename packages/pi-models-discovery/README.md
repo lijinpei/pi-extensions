@@ -18,7 +18,7 @@ pi install npm:pi-models-discovery
 /config:model-discovery
 ```
 
-Interactively add / remove / rediscover providers. The command opens a settings panel that lists every provider marked with `discoverModels`; selecting one opens its fields (enable/disable discovery, baseUrl, api type, apiKey, display name, model-list URL, metadata URL, metadata provider, startup refresh) plus actions to rediscover or remove it. Adding a provider asks for id, baseUrl, api type, apiKey (optional) and display name (optional). Changes are written to models.json and take effect **immediately** (no /reload required). A backup is written to `models.json.discovery-bak` before each write.
+Interactively add / remove / rediscover providers. The command opens a settings panel that lists every provider marked with `discoverModels`; selecting one opens its fields (enable/disable discovery, baseUrl, api type, apiKey, display name, model-list URL, metadata URL, metadata provider, model ID prefix, startup refresh) plus actions to rediscover or remove it. Adding a provider asks for id, baseUrl, api type, apiKey (optional) and display name (optional). Changes are written to models.json and take effect **immediately** (no /reload required). A backup is written to `models.json.discovery-bak` before each write.
 
 Note: comments and custom formatting in models.json are not preserved on write (the file is reformatted with 4-space indentation).
 
@@ -61,6 +61,28 @@ If the model catalog uses a different endpoint, set the optional `modelsUrl` in 
 `modelsUrl` is used as-is for discovery and refresh only; chat requests still use `baseUrl`. When omitted or empty, discovery uses `{baseUrl}/models`. Discovery sends the provider's existing `apiKey` and `headers` to this URL, so use a trusted endpoint. The response format remains unchanged.
 
 Hand edits require `/reload` to take effect; changes made through `/config:model-discovery` apply immediately.
+
+### Shared model lists
+
+Some gateways expose a model list through one protocol route while another route accepts inference but returns an empty list. Set `modelsUrl` to the shared list and `modelIdPrefix` to a case-sensitive prefix to select the intended family:
+
+```json
+{
+  "providers": {
+    "messages-gateway": {
+      "baseUrl": "https://api.example.com/anthropic",
+      "modelsUrl": "https://api.example.com/openai/models",
+      "modelIdPrefix": "claude-",
+      "api": "anthropic-messages",
+      "discoverModels": true,
+      "metadataUrl": "https://models.dev/api.json",
+      "metadataProvider": "anthropic"
+    }
+  }
+}
+```
+
+The prefix is optional; empty or omitted keeps all conversational models. Matching preserves the endpoint's exact ID. Prefix changes invalidate the model cache and take effect immediately in the settings panel. A filtered empty list uses the normal cache/static fallback. The list URL does not change the inference URL or protocol. A shared list advertises models for the gateway; test a model with `/model_test` to confirm that it works on the selected route.
 
 ### Optional canonical metadata
 
@@ -132,7 +154,7 @@ Tests make real requests and may incur gateway charges. Discovery itself only re
 
 ## Behavior
 
-- **Startup**: register matching cached models, then refresh the endpoint list and configured metadata catalog. Set provider `refreshOnStartup: false` to skip the startup network refresh when cached models exist. The model cache lives at `~/.pi/agent/extensions/pi-models-discovery/cache.json`. The cache is invalidated automatically when the provider configuration fingerprint (baseUrl+api+apiKey+headers+compat+modelsUrl+metadataUrl+metadataProvider) changes, triggering a fresh network discovery.
+- **Startup**: register matching cached models, then refresh the endpoint list and configured metadata catalog. Set provider `refreshOnStartup: false` to skip the startup network refresh when cached models exist. The model cache lives at `~/.pi/agent/extensions/pi-models-discovery/cache.json`. The cache is invalidated automatically when the provider configuration fingerprint (baseUrl+api+apiKey+headers+compat+modelsUrl+modelIdPrefix+metadataUrl+metadataProvider) changes, triggering a fresh network discovery.
 - **Online refresh**: `/config:model-discovery-refresh`, or the `refreshModels` hook triggered when opening `/model`, rediscovers online and updates the cache.
 - **Offline / fetch failure**: matching cached models are retained, or handwritten `models` in models.json (if any) are kept as a fallback, and an explicit warning is surfaced via in-session notify — never a silent degradation. One provider failing does not affect the others.
 - **apiKey resolution** (discovery request only): supports literals and `$ENV_VAR` / `${ENV_VAR}` interpolation; `!command` values skip discovery with an explicit warning (chat requests are still resolved by pi itself and are unaffected).

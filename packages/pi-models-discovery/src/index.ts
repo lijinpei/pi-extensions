@@ -91,6 +91,7 @@ interface DiscoveryProviderEntry {
 	name?: string;
 	baseUrl?: string;
 	modelsUrl?: string;
+	modelIdPrefix?: string;
 	metadataUrl?: string;
 	metadataProvider?: string;
 	refreshOnStartup?: boolean;
@@ -147,6 +148,7 @@ function providerFingerprint(entry: DiscoveryProviderEntry): string {
 		entry.compat ?? {},
 		// 未配置 modelsUrl 时保留已有指纹，避免让旧缓存失效。
 		...(entry.modelsUrl ? [entry.modelsUrl] : []),
+		...(entry.modelIdPrefix ? [{ modelIdPrefix: entry.modelIdPrefix }] : []),
 		...(entry.metadataUrl ? [{ metadataUrl: entry.metadataUrl, metadataProvider: entry.metadataProvider ?? "" }] : []),
 	]);
 }
@@ -264,6 +266,7 @@ function pickDiscoveryProviders(data: Record<string, unknown>): DiscoveryProvide
 			name: typeof value.name === "string" ? value.name : undefined,
 			baseUrl: typeof value.baseUrl === "string" ? value.baseUrl : undefined,
 			modelsUrl: typeof value.modelsUrl === "string" ? value.modelsUrl : undefined,
+			modelIdPrefix: typeof value.modelIdPrefix === "string" ? value.modelIdPrefix.trim() : undefined,
 			metadataUrl: typeof value.metadataUrl === "string" ? value.metadataUrl.trim() : undefined,
 			metadataProvider: typeof value.metadataProvider === "string" ? value.metadataProvider.trim() : undefined,
 			refreshOnStartup: value.refreshOnStartup !== false,
@@ -466,7 +469,8 @@ async function fetchModels(
 	const payload: unknown = await response.json();
 	const entries = Array.isArray(payload) ? payload : asRecord(payload).data;
 	const available = [...new Map((Array.isArray(entries) ? entries : []).map((value) => endpointModel(value, entry.api))
-		.filter((model) => model !== undefined).map((model) => [model.id, model])).values()];
+		.filter((model) => model !== undefined && (!entry.modelIdPrefix || model.id.startsWith(entry.modelIdPrefix)))
+		.map((model) => [model.id, model])).values()];
 	if (available.length === 0) throw new Error(i18n.t("emptyModelList", { url }));
 	let catalog: MetadataCatalog | undefined;
 	if (entry.metadataUrl) {
@@ -495,6 +499,7 @@ async function fetchModels(
 function fetchWithCache(cache: FetchCache, entry: DiscoveryProviderEntry, notices: Notice[]): Promise<DiscoveredModels> {
 	const cacheKey = JSON.stringify([
 		getModelsUrl(entry), entry.api ?? "", entry.apiKey ?? "", entry.headers ?? {}, entry.compat ?? {},
+		entry.modelIdPrefix ?? "",
 		entry.metadataUrl ?? "", entry.metadataProvider ?? "", entry.metadataUrl ? entry.id : "",
 	]);
 	let pending = cache.models.get(cacheKey);
@@ -643,6 +648,7 @@ function toPanelProvider(entry: DiscoveryProviderEntry): PanelProvider {
 		id: entry.id,
 		baseUrl: entry.baseUrl ?? "",
 		modelsUrl: entry.modelsUrl ?? "",
+		modelIdPrefix: entry.modelIdPrefix ?? "",
 		metadataUrl: entry.metadataUrl ?? "",
 		metadataProvider: entry.metadataProvider ?? "",
 		refreshOnStartup: entry.refreshOnStartup !== false,
@@ -672,7 +678,7 @@ async function persistProvider(provider: PanelProvider): Promise<{ backup: strin
 	if (!existing) throw new Error(i18n.t("panelProviderMissing", { id: provider.id }));
 	const entry: Record<string, unknown> = { ...existing, baseUrl: provider.baseUrl, api: provider.api };
 	entry.refreshOnStartup = provider.refreshOnStartup;
-	for (const field of ["modelsUrl", "metadataUrl", "metadataProvider"] as const) {
+	for (const field of ["modelsUrl", "modelIdPrefix", "metadataUrl", "metadataProvider"] as const) {
 		if (provider[field]) entry[field] = provider[field];
 		else delete entry[field];
 	}
@@ -698,7 +704,7 @@ async function persistNewProvider(provider: PanelProvider): Promise<{ backup: st
 		[DISCOVERY_MARKER]: true,
 		refreshOnStartup: provider.refreshOnStartup,
 	};
-	for (const field of ["modelsUrl", "metadataUrl", "metadataProvider"] as const) {
+	for (const field of ["modelsUrl", "modelIdPrefix", "metadataUrl", "metadataProvider"] as const) {
 		if (provider[field]) entry[field] = provider[field];
 	}
 	if (provider.apiKey) entry.apiKey = provider.apiKey;
@@ -820,6 +826,7 @@ function registerDiscoveryCommand(pi: ExtensionAPI, sink: NoticeSink) {
 							id: provider.id,
 							baseUrl: provider.baseUrl,
 							modelsUrl: provider.modelsUrl || undefined,
+							modelIdPrefix: provider.modelIdPrefix || undefined,
 							metadataUrl: provider.metadataUrl || undefined,
 							metadataProvider: provider.metadataProvider || undefined,
 							api: provider.api,
@@ -956,6 +963,7 @@ async function addProviderFromPanel(options: {
 			name: provider.name || undefined,
 			baseUrl: provider.baseUrl,
 			modelsUrl: provider.modelsUrl || undefined,
+			modelIdPrefix: provider.modelIdPrefix || undefined,
 			metadataUrl: provider.metadataUrl || undefined,
 			metadataProvider: provider.metadataProvider || undefined,
 			refreshOnStartup: provider.refreshOnStartup,

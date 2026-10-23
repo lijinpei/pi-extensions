@@ -46,6 +46,7 @@ export const PROVIDER_FIELD = {
 	/** API 地址。 */
 	baseUrl: "baseUrl",
 	modelsUrl: "modelsUrl",
+	modelIdPrefix: "modelIdPrefix",
 	metadataUrl: "metadataUrl",
 	metadataProvider: "metadataProvider",
 	refreshOnStartup: "refreshOnStartup",
@@ -84,6 +85,7 @@ export interface PanelProvider {
 	/** baseUrl。 */
 	baseUrl: string;
 	modelsUrl: string;
+	modelIdPrefix: string;
 	metadataUrl: string;
 	metadataProvider: string;
 	refreshOnStartup: boolean;
@@ -133,6 +135,7 @@ const PROVIDER_ROWS: readonly {
 	{ id: PROVIDER_FIELD.metadataProvider, kind: "text", labelKey: "panelLabelMetadataProvider", descriptionKey: "panelDescMetadataProvider" },
 	{ id: PROVIDER_FIELD.api, kind: "choice", labelKey: "panelLabelApi", descriptionKey: "panelDescApi" },
 	{ id: PROVIDER_FIELD.apiKey, kind: "text", labelKey: "panelLabelApiKey", descriptionKey: "panelDescApiKey" },
+	{ id: PROVIDER_FIELD.modelIdPrefix, kind: "text", labelKey: "panelLabelModelIdPrefix", descriptionKey: "panelDescModelIdPrefix" },
 	{ id: PROVIDER_FIELD.rediscover, kind: "action", labelKey: "panelLabelRediscover", descriptionKey: "panelDescRediscover" },
 	{ id: PROVIDER_FIELD.remove, kind: "action", labelKey: "panelLabelRemove", descriptionKey: "panelDescRemove" },
 ];
@@ -184,6 +187,8 @@ function readProviderField(provider: PanelProvider, id: ProviderFieldId): string
 			return provider.baseUrl;
 		case PROVIDER_FIELD.modelsUrl:
 			return provider.modelsUrl;
+		case PROVIDER_FIELD.modelIdPrefix:
+			return provider.modelIdPrefix;
 		case PROVIDER_FIELD.metadataUrl:
 			return provider.metadataUrl;
 		case PROVIDER_FIELD.metadataProvider:
@@ -232,6 +237,7 @@ export function applyProviderChange(
 		case PROVIDER_FIELD.name:
 		case PROVIDER_FIELD.apiKey:
 		case PROVIDER_FIELD.modelsUrl:
+		case PROVIDER_FIELD.modelIdPrefix:
 		case PROVIDER_FIELD.metadataUrl:
 		case PROVIDER_FIELD.metadataProvider:
 			return { ...provider, [id]: value === i18n.t("panelValueUnset") ? "" : value.trim() };
@@ -562,6 +568,7 @@ export async function openDiscoveryPanel(
 				id: input.id,
 				baseUrl: input.baseUrl,
 				modelsUrl: "",
+				modelIdPrefix: "",
 				metadataUrl: "",
 				metadataProvider: "",
 				refreshOnStartup: true,

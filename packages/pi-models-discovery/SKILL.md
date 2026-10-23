@@ -24,6 +24,10 @@ description: "配置与排查 models.json 的动态模型发现、缓存刷新�
 
 `apiKey` 可用字面量、`$ENV_VAR` 或 `${ENV_VAR}`；`!command` 不用于发现请求，会被跳过并警告。不要把密钥写入 Skill、仓库或回复。
 
+## 共享列表
+
+路由可正常聊天但 `/models` 为空时，可显式把 `modelsUrl` 指向同网关的共享模型列表，并用区分大小写的 `modelIdPrefix` 限定模型系列。前缀留空不过滤；模型 ID 保持原样，聊天仍使用 provider 的 `baseUrl` 和 `api`。不要把其他协议的所有模型注册到此路由；用 `/model_test provider/model` 验证实际可用性。
+
 ## 思考等级
 
 发现的模型默认隐藏 `xhigh` / `max`（映射为 `null`），标准档位沿用 Pi 默认映射。provider 的 `compat.thinkingLevelMap` 可显式开启支持的档位或将不支持的档位置 `null`；非推理服务用 `compat.reasoning: false` 关闭推理，必要时配合 `compat.supportsReasoningEffort: false`。这两个扩展配置字段会提取到模型顶层，其余 compat 正常转发。逐模型差异用 `modelOverrides` 按 model.id 覆盖。旧缓存启动时会应用当前 compat 配置，无需联网刷新。

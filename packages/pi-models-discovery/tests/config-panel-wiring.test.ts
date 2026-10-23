@@ -112,7 +112,7 @@ test("metadata settings apply immediately and rediscovery reloads catalog and en
 		requests.push(url);
 		return Response.json(url === metadataUrl ? {
 			origin: { models: { known: { id: "known", limit: { context: contextWindow } } } },
-		} : { data: [{ id: "known" }] });
+		} : { data: [{ id: "known" }, { id: "other" }] });
 	});
 	const modelsPath = join(agentDir, "models.json");
 	await writeFile(modelsPath, JSON.stringify({ providers: { demo: {
@@ -147,7 +147,7 @@ test("metadata settings apply immediately and rediscovery reloads catalog and en
 	assert.deepEqual(saved.providers.demo.compat, { supportsDeveloperRole: true });
 
 	contextWindow = 256_000;
-	await runPanel([[ENTER], [...down(9), ENTER]]);
+	await runPanel([[ENTER], [...down(10), ENTER]]);
 	assert.equal(registrations.get("demo")!.models![0].contextWindow, 256_000, "rediscovery must bypass startup request cache");
 	assert.deepEqual(requests.slice(-2), [modelsUrl, metadataUrl]);
 
@@ -159,4 +159,10 @@ test("metadata settings apply immediately and rediscovery reloads catalog and en
 	await runPanel([[ENTER], [...down(1), " ", "\u001B"]]);
 	assert.equal(JSON.parse(await readFile(modelsPath, "utf8")).providers.demo.refreshOnStartup, false);
 	assert.equal(requests.length, beforeToggle, "changing the startup policy must not discard an otherwise valid cache");
+	await runPanel([[ENTER], [...down(9), ENTER, "known", ENTER, "\u001B"]]);
+	assert.equal(JSON.parse(await readFile(modelsPath, "utf8")).providers.demo.modelIdPrefix, "known");
+	assert.deepEqual(registrations.get("demo")!.models!.map((model) => model.id), ["known"], "prefix filtering applies immediately");
+	await runPanel([[ENTER], [...down(9), ENTER, "\u0001", "\u000B", ENTER, "\u001B"]]);
+	assert.equal(JSON.parse(await readFile(modelsPath, "utf8")).providers.demo.modelIdPrefix, undefined);
+	assert.deepEqual(registrations.get("demo")!.models!.map((model) => model.id), ["known", "other"]);
 });

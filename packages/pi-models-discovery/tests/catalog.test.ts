@@ -939,3 +939,48 @@ test("only conversational models register and Responses-only models preserve the
 	assert.equal(h.registrations.get("gateway")!.models!.find((model) => model.id === "responses")!.api, "openai-responses");
 	assert.equal(h.registrations.get("gateway")!.models!.find((model) => model.id === "responses")!.thinkingLevelMap.max, "max");
 });
+
+test("shared model lists can be filtered independently while preserving each route's chat URL and protocol", async (t) => {
+	const h = await discoveryHarness(t, [
+		{ id: "chat-one", context_length: 128_000 }, { id: "chat-two" }, { id: "other-one" },
+		{ id: "chat-embedding", mode: "embedding" }, { id: "CHAT-uppercase" },
+	]);
+	const modelsUrl = "https://catalog.example.com/shared/models";
+	const baseUrl = "https://api.example.com/anthropic";
+	await h.configure({
+		messages: { ...discoveryProvider, baseUrl, modelsUrl, modelIdPrefix: "chat-", api: "anthropic-messages", apiKey: "test-key" },
+		other: { ...discoveryProvider, modelsUrl, modelIdPrefix: "other-" },
+	});
+	await h.start();
+	assert.deepEqual(h.registrations.get("messages")!.models!.map((model) => model.id), ["chat-one", "chat-two"]);
+	assert.deepEqual(h.registrations.get("other")!.models!.map((model) => model.id), ["other-one"]);
+	const registry = await piRegistry(h);
+	const selected = registry.find("messages", "chat-one")!;
+	assert.equal(selected.api, "anthropic-messages");
+	assert.equal(selected.baseUrl, baseUrl);
+	assert.equal(selected.contextWindow, 128_000);
+	assert.equal(registry.find("messages", "other-one"), undefined);
+	const count = h.requests.length;
+	await h.start();
+	assert.equal(h.requests.length, count, "filtered results persist in the startup cache");
+	const models = await h.registrations.get("messages")!.refreshModels!(refreshContext(true));
+	assert.deepEqual(models.map((model) => model.id), ["chat-one", "chat-two"]);
+	assert.equal(h.requests.at(-1)!.url, modelsUrl, "refresh uses the shared catalog URL");
+});
+
+test("changing or clearing a model ID prefix invalidates cache without leaking previously excluded models", async (t) => {
+	const h = await discoveryHarness(t, [{ id: "one-model" }, { id: "two-model" }]);
+	for (const [prefix, expected] of [["one-", ["one-model"]], ["two-", ["two-model"]], ["", ["one-model", "two-model"]]] as const) {
+		await h.configure({ route: { ...discoveryProvider, modelIdPrefix: prefix } });
+		const before = h.requests.length;
+		await h.start();
+		assert.equal(h.requests.length, before + 1);
+		assert.deepEqual(h.registrations.get("route")!.models!.map((model) => model.id), expected);
+		await h.start();
+		assert.equal(h.requests.length, before + 1);
+	}
+	await h.configure({ route: { ...discoveryProvider, modelIdPrefix: "missing-", metadataUrl } });
+	await h.start();
+	assert.equal(h.registrations.get("route")!.models, undefined, "empty filtered lists use static fallback");
+	assert.ok(!h.requests.some((request) => request.url === metadataUrl), "catalog cannot establish route availability");
+});
