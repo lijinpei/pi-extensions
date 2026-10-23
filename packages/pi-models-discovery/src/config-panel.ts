@@ -25,7 +25,7 @@ import {
 	type SettingItem,
 	Text,
 } from "@earendil-works/pi-tui";
-import { createTranslator, loadCatalog } from "pi-extensions-i18n";
+import { createTranslator, loadCatalog, notifyWithSource, NOTICE_TAG_COLOR } from "pi-extensions-i18n";
 
 const i18n = createTranslator(loadCatalog(new URL("../locales/index.json", import.meta.url)));
 
@@ -45,6 +45,10 @@ export const PROVIDER_FIELD = {
 	name: "name",
 	/** API 地址。 */
 	baseUrl: "baseUrl",
+	modelsUrl: "modelsUrl",
+	metadataUrl: "metadataUrl",
+	metadataProvider: "metadataProvider",
+	refreshOnStartup: "refreshOnStartup",
 	/** api 类型。 */
 	api: "api",
 	/** API Key；支持 $ENV_VAR 插值。 */
@@ -79,6 +83,10 @@ export interface PanelProvider {
 	id: string;
 	/** baseUrl。 */
 	baseUrl: string;
+	modelsUrl: string;
+	metadataUrl: string;
+	metadataProvider: string;
+	refreshOnStartup: boolean;
 	/** api 类型。 */
 	api: string;
 	/** apiKey；空串表示未设置。 */
@@ -117,8 +125,12 @@ const PROVIDER_ROWS: readonly {
 	descriptionKey: string;
 }[] = [
 	{ id: PROVIDER_FIELD.enabled, kind: "toggle", labelKey: "panelLabelEnabled", descriptionKey: "panelDescEnabled" },
+	{ id: PROVIDER_FIELD.refreshOnStartup, kind: "toggle", labelKey: "panelLabelRefreshOnStartup", descriptionKey: "panelDescRefreshOnStartup" },
 	{ id: PROVIDER_FIELD.name, kind: "text", labelKey: "panelLabelName", descriptionKey: "panelDescName" },
 	{ id: PROVIDER_FIELD.baseUrl, kind: "text", labelKey: "panelLabelBaseUrl", descriptionKey: "panelDescBaseUrl" },
+	{ id: PROVIDER_FIELD.modelsUrl, kind: "text", labelKey: "panelLabelModelsUrl", descriptionKey: "panelDescModelsUrl" },
+	{ id: PROVIDER_FIELD.metadataUrl, kind: "text", labelKey: "panelLabelMetadataUrl", descriptionKey: "panelDescMetadataUrl" },
+	{ id: PROVIDER_FIELD.metadataProvider, kind: "text", labelKey: "panelLabelMetadataProvider", descriptionKey: "panelDescMetadataProvider" },
 	{ id: PROVIDER_FIELD.api, kind: "choice", labelKey: "panelLabelApi", descriptionKey: "panelDescApi" },
 	{ id: PROVIDER_FIELD.apiKey, kind: "text", labelKey: "panelLabelApiKey", descriptionKey: "panelDescApiKey" },
 	{ id: PROVIDER_FIELD.rediscover, kind: "action", labelKey: "panelLabelRediscover", descriptionKey: "panelDescRediscover" },
@@ -154,7 +166,7 @@ function apiOptions(): PanelOption[] {
 
 /** 某个字段的候选表；文本和动作字段没有候选项。 */
 function fieldOptions(id: ProviderFieldId): PanelOption[] {
-	if (id === PROVIDER_FIELD.enabled) return toggleOptions();
+	if (id === PROVIDER_FIELD.enabled || id === PROVIDER_FIELD.refreshOnStartup) return toggleOptions();
 	if (id === PROVIDER_FIELD.api) return apiOptions();
 	return [];
 }
@@ -164,10 +176,18 @@ function readProviderField(provider: PanelProvider, id: ProviderFieldId): string
 	switch (id) {
 		case PROVIDER_FIELD.enabled:
 			return provider.enabled ? "on" : "off";
+		case PROVIDER_FIELD.refreshOnStartup:
+			return provider.refreshOnStartup ? "on" : "off";
 		case PROVIDER_FIELD.name:
 			return provider.name;
 		case PROVIDER_FIELD.baseUrl:
 			return provider.baseUrl;
+		case PROVIDER_FIELD.modelsUrl:
+			return provider.modelsUrl;
+		case PROVIDER_FIELD.metadataUrl:
+			return provider.metadataUrl;
+		case PROVIDER_FIELD.metadataProvider:
+			return provider.metadataProvider;
 		case PROVIDER_FIELD.api:
 			return provider.api;
 		case PROVIDER_FIELD.apiKey:
@@ -180,12 +200,12 @@ function readProviderField(provider: PanelProvider, id: ProviderFieldId): string
 /** 面板上显示的当前值；文本字段留空时显示「未设置」。 */
 function displayProviderValue(provider: PanelProvider, id: ProviderFieldId): string {
 	const stored = readProviderField(provider, id);
-	if (id === PROVIDER_FIELD.enabled) {
+	if (id === PROVIDER_FIELD.enabled || id === PROVIDER_FIELD.refreshOnStartup) {
 		const labels = toggleLabels();
 		return stored === "on" ? labels.on : labels.off;
 	}
 	if (id === PROVIDER_FIELD.api) return optionLabelForValue(apiOptions(), stored);
-	if (id === PROVIDER_FIELD.apiKey || id === PROVIDER_FIELD.name) {
+	if (PROVIDER_ROWS.some((row) => row.id === id && row.kind === "text") && id !== PROVIDER_FIELD.baseUrl) {
 		return stored || i18n.t("panelValueUnset");
 	}
 	return stored;
@@ -204,20 +224,23 @@ export function applyProviderChange(
 ): PanelProvider | undefined {
 	const labels = toggleLabels();
 	switch (id) {
-		case PROVIDER_FIELD.enabled: {
+		case PROVIDER_FIELD.enabled:
+		case PROVIDER_FIELD.refreshOnStartup: {
 			if (value !== labels.on && value !== labels.off) return undefined;
-			return { ...provider, enabled: value === labels.on };
+			return { ...provider, [id]: value === labels.on };
 		}
 		case PROVIDER_FIELD.name:
-			return { ...provider, name: value.trim() };
+		case PROVIDER_FIELD.apiKey:
+		case PROVIDER_FIELD.modelsUrl:
+		case PROVIDER_FIELD.metadataUrl:
+		case PROVIDER_FIELD.metadataProvider:
+			return { ...provider, [id]: value === i18n.t("panelValueUnset") ? "" : value.trim() };
 		case PROVIDER_FIELD.baseUrl:
 			return { ...provider, baseUrl: value.trim() };
 		case PROVIDER_FIELD.api: {
 			const api = optionValueFromLabel(apiOptions(), value);
 			return api === undefined ? undefined : { ...provider, api };
 		}
-		case PROVIDER_FIELD.apiKey:
-			return { ...provider, apiKey: value.trim() };
 		default:
 			return undefined;
 	}
@@ -321,7 +344,10 @@ export function buildProviderItems(provider: PanelProvider): SettingItem[] {
 				description,
 				currentValue,
 				submenu: (_current, done) =>
-					createTextSubmenu(readProviderField(provider, row.id), description, done),
+					createTextSubmenu(readProviderField(provider, row.id), description, (value) => {
+						if (value === undefined) done(undefined);
+						else done(value.trim() || (row.id === PROVIDER_FIELD.baseUrl ? "" : i18n.t("panelValueUnset")));
+					}),
 			};
 		}
 		return actionRow({ id: row.id, label, description, currentValue: i18n.t("panelActionHint") });
@@ -461,7 +487,7 @@ async function askValidated(
 	if (!value) return undefined;
 	const failure = options.validate(value);
 	if (failure) {
-		ctx.ui.notify(i18n.t(failure.key, failure.params), "error");
+		notifyWithSource({ ctx, source: { tag: "models", color: NOTICE_TAG_COLOR }, level: "error", message: i18n.t(failure.key, failure.params) });
 		return undefined;
 	}
 	return value;
@@ -535,6 +561,10 @@ export async function openDiscoveryPanel(
 			const provider: PanelProvider = {
 				id: input.id,
 				baseUrl: input.baseUrl,
+				modelsUrl: "",
+				metadataUrl: "",
+				metadataProvider: "",
+				refreshOnStartup: true,
 				api: input.api,
 				apiKey: input.apiKey,
 				name: input.name,

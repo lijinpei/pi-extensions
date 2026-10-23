@@ -21,15 +21,16 @@
  *
  * 行为约定：
  * - 首次发现成功后，模型列表持久化到 ~/.pi/agent/extensions/pi-models-discovery/cache.json；
- *   之后每次启动直接读缓存注册，不请求网络。配置指纹
- *   （baseUrl+api+apiKey+headers+compat+modelsUrl）变化时缓存自动失效，重新走网络发现。
+ *   之后每次启动先注册缓存并自动刷新；refreshOnStartup=false 时缓存命中不联网。配置指纹
+ *   （baseUrl+api+apiKey+headers+compat+modelsUrl+metadataUrl+metadataProvider）变化时缓存自动失效。
  * - /config:model-discovery-refresh 强制重新拉取所有发现 provider 并更新缓存；
  *   /model 打开时触发的在线 refreshModels 同样走网络并同步更新缓存。
  * - baseUrl / api 由扩展显式转发（pi 的 extension 组合层要求），
  *   apiKey / name / headers / compat 不写回注册配置，由 pi 的 models.json 层回落生效。
  * - provider 级 compat 会被合并进每个发现的模型（pi 的 models.json provider 级 compat
  *   不作用于 extension 注册的模型，故在此转发）。
- * - 同一模型列表 URL+apiKey+headers+compat 的多个 provider 共享一次发现请求。
+ * - 元数据查询可用 models.dev 或模型列表 API；端点列表决定可用性，端点元数据优先。
+ * - 目录请求不携带 provider 凭证；同一目录 URL 在一次启动或刷新中共享，结果自动保存到 metadata.json。
  * - 发现失败：该 provider 保留 models.json 手写 models（如有，作为离线回退），
  *   并通过 notify 显式警告，不静默降级；单个 provider 失败不影响其他 provider 注册。
  * - 注册 refreshModels：打开 /model 触发在线刷新时重新发现；
@@ -42,17 +43,25 @@
  *   "!command" 形式的 apiKey 跳过发现（显式警告），pi 发起聊天请求时仍由 pi 自身解析。
  * - /config:model-discovery 命令对 models.json 的修改立即生效（registerProvider 运行时可直接调用）；
  *   直接手编 models.json 后需 /reload 扩展生效。
- * - 本插件不使用 console.*：所有用户可见消息走 ctx.ui.notify；
+ * - 用户可见消息走 notifyWithSource；
  *   加载期（无 ctx）产生的消息收集到 pendingNotices，session_start 时统一 flush。
  */
 
-import type { Api, ModelCostRates } from "@earendil-works/pi-ai";
+import type { Api } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { NOTICE_TAG_COLOR, createTranslator, installNoticeRenderer, loadCatalog, notifyWithSource, type NoticeColor, type NoticeSource } from "pi-extensions-i18n";
 import { openDiscoveryPanel, type PanelProvider } from "./config-panel.ts";
+import {
+	EFFORT_LEVELS, advertisedThinking, asRecord, endpointModel, findMetadata, mergeMetadata, parseMetadataCatalog,
+	type AdvertisedThinking, type EffortLevel, type MetadataCatalog, type ModelMetadata, type ThinkingLevelMap,
+} from "./metadata.ts";
+import { readSavedMetadata, saveMetadata } from "./metadata-store.ts";
+import { updateJsonFile } from "./storage.ts";
+import { registerModelTestCommand } from "./model-test.ts";
+export type { AdvertisedThinking, ModelMetadata } from "./metadata.ts";
 
 const i18n = createTranslator(loadCatalog(new URL("../locales/index.json", import.meta.url)));
 
@@ -82,38 +91,15 @@ interface DiscoveryProviderEntry {
 	name?: string;
 	baseUrl?: string;
 	modelsUrl?: string;
+	metadataUrl?: string;
+	metadataProvider?: string;
+	refreshOnStartup?: boolean;
 	apiKey?: string;
 	api?: string;
 	headers?: Record<string, string>;
 	compat?: Record<string, unknown>;
 	/** 发现标记；面板关闭发现时写 false（实际会删掉这个键）。 */
 	discoverModels?: boolean;
-}
-
-/** 可能对应后端 effort 值的 Pi 思考档位（off 除外）。 */
-const EFFORT_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
-type EffortLevel = typeof EFFORT_LEVELS[number];
-const THINKING_LEVELS = ["off", ...EFFORT_LEVELS] as const;
-type ThinkingLevelMap = NonNullable<ProviderModelConfig["thinkingLevelMap"]>;
-
-/** 模型列表声明的思考档位；缓存保存声明本身，注册时再结合 api 与 provider compat 推导映射。 */
-export interface AdvertisedThinking {
-	/** 模型条目显式给出的 Pi 档位映射。 */
-	thinkingLevelMap?: ThinkingLevelMap;
-	/** capabilities.effort 中逐个后端 effort 值的支持情况；未声明的值不出现。 */
-	effort?: Partial<Record<EffortLevel, boolean>>;
-}
-
-/** 模型列表条目按别名归一后的元数据；缺失字段由 buildModel 补默认值。 */
-export interface ModelMetadata {
-	id: string;
-	name?: string;
-	contextWindow?: number;
-	maxTokens?: number;
-	input?: ProviderModelConfig["input"];
-	reasoning?: boolean;
-	thinking?: AdvertisedThinking;
-	cost?: Partial<ModelCostRates>;
 }
 
 /** 持久化缓存中单个 provider 的条目 */
@@ -161,6 +147,7 @@ function providerFingerprint(entry: DiscoveryProviderEntry): string {
 		entry.compat ?? {},
 		// 未配置 modelsUrl 时保留已有指纹，避免让旧缓存失效。
 		...(entry.modelsUrl ? [entry.modelsUrl] : []),
+		...(entry.metadataUrl ? [{ metadataUrl: entry.metadataUrl, metadataProvider: entry.metadataProvider ?? "" }] : []),
 	]);
 }
 
@@ -200,15 +187,15 @@ async function persistCachedModels(
 	notices: Notice[],
 ): Promise<void> {
 	try {
-		const cache = await readCache([]);
-		cache.providers[entry.id] = {
-			fingerprint: providerFingerprint(entry),
-			fetchedAt: new Date().toISOString(),
-			models: discovered.models,
-			advertisedThinking: discovered.advertisedThinking,
-		};
-		await mkdir(dirname(cachePath()), { recursive: true });
-		await writeFile(cachePath(), `${JSON.stringify(cache, null, 2)}\n`, "utf-8");
+		await updateJsonFile<CacheFile>(cachePath(), () => ({ version: 1, providers: {} }), (cache) => {
+			cache.providers = asRecord(cache.providers) as CacheFile["providers"];
+			cache.providers[entry.id] = {
+				fingerprint: providerFingerprint(entry),
+				fetchedAt: new Date().toISOString(),
+				models: discovered.models,
+				advertisedThinking: discovered.advertisedThinking,
+			};
+		});
 	} catch (err) {
 		notices.push({
 			level: "warning",
@@ -220,11 +207,10 @@ async function persistCachedModels(
 /** 删除 provider 时同步移除其缓存条目 */
 async function removeCachedModels(id: string, notices: Notice[]): Promise<void> {
 	try {
-		const cache = await readCache([]);
-		if (!(id in cache.providers)) return;
-		delete cache.providers[id];
-		await mkdir(dirname(cachePath()), { recursive: true });
-		await writeFile(cachePath(), `${JSON.stringify(cache, null, 2)}\n`, "utf-8");
+		await updateJsonFile<CacheFile>(cachePath(), () => ({ version: 1, providers: {} }), (cache) => {
+			cache.providers = asRecord(cache.providers) as CacheFile["providers"];
+			delete cache.providers[id];
+		});
 	} catch (err) {
 		notices.push({
 			level: "warning",
@@ -278,6 +264,9 @@ function pickDiscoveryProviders(data: Record<string, unknown>): DiscoveryProvide
 			name: typeof value.name === "string" ? value.name : undefined,
 			baseUrl: typeof value.baseUrl === "string" ? value.baseUrl : undefined,
 			modelsUrl: typeof value.modelsUrl === "string" ? value.modelsUrl : undefined,
+			metadataUrl: typeof value.metadataUrl === "string" ? value.metadataUrl.trim() : undefined,
+			metadataProvider: typeof value.metadataProvider === "string" ? value.metadataProvider.trim() : undefined,
+			refreshOnStartup: value.refreshOnStartup !== false,
 			apiKey: typeof value.apiKey === "string" ? value.apiKey : undefined,
 			api: typeof value.api === "string" ? value.api : undefined,
 			headers:
@@ -320,10 +309,6 @@ function resolveEnvValue(raw: string): { value: string | null; error: string | n
 		return { value: null, error: i18n.t("envMissing", { names: missing.join(", ") }) };
 	}
 	return { value, error: null };
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-	return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
 /** 推导思考档位只需要 provider 的 api 与 compat。 */
@@ -381,92 +366,12 @@ function modelThinking(provider: ThinkingProvider | undefined, discoveredReasoni
 	};
 }
 
-function nonEmptyString(...values: unknown[]): string | undefined {
-	return values.find((value): value is string => typeof value === "string" && value.trim().length > 0);
-}
-
-/** 只保留 Pi 已知档位的非空字符串或 null；没有有效项时视为未声明。 */
-function validThinkingLevelMap(value: unknown): ThinkingLevelMap | undefined {
-	const raw = asRecord(value);
-	const map: ThinkingLevelMap = {};
-	for (const level of THINKING_LEVELS) {
-		const mapped = raw[level];
-		if (mapped === null || nonEmptyString(mapped)) map[level] = mapped as string | null;
-	}
-	return Object.keys(map).length > 0 ? map : undefined;
-}
-
-/** effort 整体声明不支持时不推导任何档位；逐值只接受布尔或 { supported: 布尔 }。 */
-function effortSupport(value: unknown): AdvertisedThinking["effort"] {
-	if (capabilitySupported(value) === false) return undefined;
-	const raw = asRecord(value);
-	const support: AdvertisedThinking["effort"] = {};
-	for (const level of EFFORT_LEVELS) {
-		const supported = capabilitySupported(raw[level]);
-		if (supported !== undefined) support[level] = supported;
-	}
-	return Object.keys(support).length > 0 ? support : undefined;
-}
-
-/** 显式映射取第一个含有效项的别名；模型列表与缓存共用同一套校验。 */
-function advertisedThinking(maps: unknown[], effort: unknown): AdvertisedThinking | undefined {
-	const thinkingLevelMap = maps.map(validThinkingLevelMap).find((map) => map !== undefined);
-	const effortLevels = effortSupport(effort);
-	return thinkingLevelMap || effortLevels ? { thinkingLevelMap, effort: effortLevels } : undefined;
-}
-
-function positiveTokenLimit(...values: unknown[]): number | undefined {
-	return values.find((value): value is number => typeof value === "number" && Number.isSafeInteger(value) && value > 0);
-}
-
-function nonNegativeCost(...values: unknown[]): number | undefined {
-	return values.find((value): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0);
-}
-
-function capabilitySupported(value: unknown): boolean | undefined {
-	const supported = typeof value === "boolean" ? value : asRecord(value).supported;
-	return typeof supported === "boolean" ? supported : undefined;
-}
-
-/** 聊天模型始终接受 text；显式 input 数组或 vision 能力只决定是否加上 image。 */
-function modelInput(input: unknown, capabilities: Record<string, unknown>): ProviderModelConfig["input"] | undefined {
-	const image = Array.isArray(input) && (input.includes("text") || input.includes("image"))
-		? input.includes("image")
-		: capabilitySupported(capabilities.vision) ?? capabilitySupported(capabilities.image_input);
-	return image === undefined ? undefined : image ? ["text", "image"] : ["text"];
-}
-
-/** 按 README「模型元数据」表的别名优先级归一单个模型列表条目；无有效 id 时返回 undefined。 */
-function canonicalizeModel(value: unknown): ModelMetadata | undefined {
-	const raw = asRecord(value);
-	if (typeof raw.id !== "string" || raw.id.length === 0) return undefined;
-	const capabilities = asRecord(raw.capabilities);
-	const cost = asRecord(raw.cost);
-	const pricing = asRecord(raw.pricing);
-	return {
-		id: raw.id,
-		name: nonEmptyString(raw.name, raw.display_name),
-		contextWindow: positiveTokenLimit(raw.context_window, raw.contextWindow, raw.max_model_len, raw.context_length, raw.max_context_length, raw.max_input_tokens),
-		maxTokens: positiveTokenLimit(raw.max_tokens, raw.maxTokens, raw.max_output_tokens, raw.max_completion_tokens),
-		input: modelInput(raw.input, capabilities),
-		reasoning: capabilitySupported(raw.reasoning)
-			?? capabilitySupported(capabilities.reasoning)
-			?? capabilitySupported(capabilities.thinking),
-		thinking: advertisedThinking([raw.thinkingLevelMap, raw.thinking_level_map], capabilities.effort),
-		cost: {
-			input: nonNegativeCost(cost.input, pricing.input_per_million),
-			output: nonNegativeCost(cost.output, pricing.output_per_million),
-			cacheRead: nonNegativeCost(cost.cacheRead, cost.cache_read, pricing.cache_read_input_per_million),
-			cacheWrite: nonNegativeCost(cost.cacheWrite, cost.cache_write, pricing.cache_creation_input_per_million),
-		},
-	};
-}
-
 export function buildModel(model: ModelMetadata, provider?: ThinkingProvider): ProviderModelConfig {
 	return {
 		id: model.id,
+		...(model.api ? { api: model.api } : {}),
 		name: model.name ?? model.id,
-		...modelThinking(provider, model.reasoning, model.thinking),
+		...modelThinking(model.api ? { ...provider, api: model.api } : provider, model.reasoning, model.thinking),
 		input: model.input ?? ["text", "image"],
 		cost: {
 			input: model.cost?.input ?? 0,
@@ -484,10 +389,45 @@ function getModelsUrl(entry: DiscoveryProviderEntry): string {
 	return entry.modelsUrl || `${(entry.baseUrl ?? "").replace(/\/+$/, "")}/models`;
 }
 
+/** Catalog requests are separate from provider requests and never inherit their credentials. */
+async function fetchMetadata(url: string, notices: Notice[]): Promise<MetadataCatalog> {
+	const parsed = new URL(url);
+	if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) {
+		throw new Error(i18n.t("invalidMetadataUrl"));
+	}
+	try {
+		const response = await fetch(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+		if (!response.ok) throw new Error(i18n.t("fetchHttpError", { url, status: response.status }));
+		const catalog = parseMetadataCatalog(await response.json());
+		if (!catalog) throw new Error(i18n.t("invalidMetadataCatalog"));
+		try {
+			await saveMetadata(url, catalog);
+		} catch (error) {
+			notices.push({ level: "warning", message: i18n.t("metadataWriteFailed", { reason: error instanceof Error ? error.message : String(error) }) });
+		}
+		return catalog;
+	} catch (error) {
+		const saved = await readSavedMetadata(url);
+		if (!saved) throw error;
+		notices.push({ level: "warning", message: i18n.t("metadataCached", { reason: error instanceof Error ? error.message : String(error) }) });
+		return saved;
+	}
+}
+
+interface FetchCache {
+	models: Map<string, Promise<DiscoveredModels>>;
+	metadata: Map<string, Promise<MetadataCatalog>>;
+}
+
+function createFetchCache(): FetchCache {
+	return { models: new Map(), metadata: new Map() };
+}
+
 /** 请求模型列表并解析为模型配置；失败抛错（错误信息带原因） */
 async function fetchModels(
 	entry: DiscoveryProviderEntry,
 	notices: Notice[],
+	metadataCache: FetchCache["metadata"] = new Map(),
 ): Promise<DiscoveredModels> {
 	if (!entry.baseUrl) {
 		throw new Error(i18n.t("missingBaseUrl"));
@@ -525,27 +465,42 @@ async function fetchModels(
 	}
 	const payload: unknown = await response.json();
 	const entries = Array.isArray(payload) ? payload : asRecord(payload).data;
+	const available = [...new Map((Array.isArray(entries) ? entries : []).map((value) => endpointModel(value, entry.api))
+		.filter((model) => model !== undefined).map((model) => [model.id, model])).values()];
+	if (available.length === 0) throw new Error(i18n.t("emptyModelList", { url }));
+	let catalog: MetadataCatalog | undefined;
+	if (entry.metadataUrl) {
+		try {
+			let pending = metadataCache.get(entry.metadataUrl);
+			if (!pending) {
+				pending = fetchMetadata(entry.metadataUrl, notices);
+				metadataCache.set(entry.metadataUrl, pending);
+			}
+			catalog = await pending;
+		} catch (err) {
+			notices.push({ level: "warning", message: `${LOG_PREFIX} ${i18n.t("metadataFailed", {
+				id: entry.id, reason: err instanceof Error ? err.message : String(err),
+			})}` });
+		}
+	}
 	const discovered: DiscoveredModels = { models: [], advertisedThinking: {} };
-	for (const model of (Array.isArray(entries) ? entries : []).map(canonicalizeModel)) {
-		if (!model) continue;
+	for (const endpointModel of available) {
+		const model = mergeMetadata(endpointModel, catalog && findMetadata(catalog, endpointModel.id, entry.id, entry.metadataProvider));
 		discovered.models.push(buildModel(model, entry));
 		if (model.thinking) discovered.advertisedThinking[model.id] = model.thinking;
-	}
-	if (discovered.models.length === 0) {
-		throw new Error(i18n.t("emptyModelList", { url }));
 	}
 	return discovered;
 }
 
-/** 缓存的是按 api 与 compat 构建的模型配置，只有 URL+api+apiKey+headers+compat 相同才可复用。 */
-type FetchCache = Map<string, Promise<DiscoveredModels>>;
-
 function fetchWithCache(cache: FetchCache, entry: DiscoveryProviderEntry, notices: Notice[]): Promise<DiscoveredModels> {
-	const cacheKey = JSON.stringify([getModelsUrl(entry), entry.api ?? "", entry.apiKey ?? "", entry.headers ?? {}, entry.compat ?? {}]);
-	let pending = cache.get(cacheKey);
+	const cacheKey = JSON.stringify([
+		getModelsUrl(entry), entry.api ?? "", entry.apiKey ?? "", entry.headers ?? {}, entry.compat ?? {},
+		entry.metadataUrl ?? "", entry.metadataProvider ?? "", entry.metadataUrl ? entry.id : "",
+	]);
+	let pending = cache.models.get(cacheKey);
 	if (!pending) {
-		pending = fetchModels(entry, notices);
-		cache.set(cacheKey, pending);
+		pending = fetchModels(entry, notices, cache.metadata);
+		cache.models.set(cacheKey, pending);
 	}
 	return pending;
 }
@@ -559,7 +514,7 @@ interface LastModelsState {
  * 构造 refreshModels：离线初始化返回最近成功列表（无记录则抛错，避免清空手写 models）；
  * 在线刷新强制重拉、更新最近列表并持久化缓存。
  */
-function createRefreshModels(entry: DiscoveryProviderEntry, notices: Notice[], state: LastModelsState) {
+function createRefreshModels(entry: DiscoveryProviderEntry, notices: Notice[], state: LastModelsState, sink?: NoticeSink) {
 	return async (context: { allowNetwork: boolean }) => {
 		if (!context.allowNetwork) {
 			if (state.lastModels.length === 0) {
@@ -567,10 +522,22 @@ function createRefreshModels(entry: DiscoveryProviderEntry, notices: Notice[], s
 			}
 			return state.lastModels;
 		}
-		const refreshed = await fetchModels(entry, notices);
-		state.lastModels = refreshed.models;
-		await persistCachedModels(entry, refreshed, notices);
-		return refreshed.models;
+		const refreshNotices: Notice[] = [];
+		try {
+			const refreshed = await fetchModels(entry, refreshNotices);
+			state.lastModels = refreshed.models;
+			await persistCachedModels(entry, refreshed, refreshNotices);
+			return refreshed.models;
+		} catch (error) {
+			refreshNotices.push({ level: "warning", message: i18n.t("discoveryFailed", { id: entry.id, reason: error instanceof Error ? error.message : String(error) }) });
+			if (state.lastModels.length > 0) return state.lastModels;
+			throw error;
+		} finally {
+			for (const notice of refreshNotices) {
+				if (sink) sink(notice);
+				else notices.push(notice);
+			}
+		}
 	};
 }
 
@@ -599,10 +566,14 @@ async function discoverAndRegister(
 	entry: DiscoveryProviderEntry,
 	fetchCache: FetchCache,
 	notices: Notice[],
+	sink?: NoticeSink,
+	cached?: CachedProviderEntry,
 ): Promise<{ count: number; models: ProviderModelConfig[] } | null> {
 	if (!validateEntry(entry, notices)) return null;
+	cached ??= (await readCache(notices)).providers[entry.id];
+	if (cached?.fingerprint !== providerFingerprint(entry) || !Array.isArray(cached?.models) || !cached.models.length) cached = undefined;
 	const state: LastModelsState = { lastModels: [] };
-	const refreshModels = createRefreshModels(entry, notices, state);
+	const refreshModels = createRefreshModels(entry, notices, state, sink);
 	try {
 		const discovered = await fetchWithCache(fetchCache, entry, notices);
 		const { models } = discovered;
@@ -621,7 +592,8 @@ async function discoverAndRegister(
 			level: "warning",
 			message: `${LOG_PREFIX} ${i18n.t("discoveryFailed", { id: entry.id, reason })}`,
 		});
-		pi.registerProvider(entry.id, {
+		if (cached) registerFromCache(pi, entry, cached, notices, sink);
+		else pi.registerProvider(entry.id, {
 			baseUrl: entry.baseUrl,
 			api: entry.api as Api,
 			refreshModels,
@@ -636,6 +608,7 @@ function registerFromCache(
 	entry: DiscoveryProviderEntry,
 	cached: CachedProviderEntry,
 	notices: Notice[],
+	sink?: NoticeSink,
 ): void {
 	if (!validateEntry(entry, notices)) return;
 	// 旧缓存含硬编码的 xhigh/max，不读缓存里合并后的映射：按当前 provider 配置与重新校验的声明重建，保持离线可用。
@@ -645,14 +618,14 @@ function registerFromCache(
 		return {
 			...model,
 			...modelThinking(
-				entry,
+				{ ...entry, api: model.api ?? entry.api },
 				typeof model?.reasoning === "boolean" ? model.reasoning : undefined,
 				advertisedThinking([thinking.thinkingLevelMap], thinking.effort),
 			),
 		};
 	});
 	const state: LastModelsState = { lastModels: models };
-	const refreshModels = createRefreshModels(entry, notices, state);
+	const refreshModels = createRefreshModels(entry, notices, state, sink);
 	pi.registerProvider(entry.id, {
 		baseUrl: entry.baseUrl,
 		api: entry.api as Api,
@@ -669,6 +642,10 @@ function toPanelProvider(entry: DiscoveryProviderEntry): PanelProvider {
 	return {
 		id: entry.id,
 		baseUrl: entry.baseUrl ?? "",
+		modelsUrl: entry.modelsUrl ?? "",
+		metadataUrl: entry.metadataUrl ?? "",
+		metadataProvider: entry.metadataProvider ?? "",
+		refreshOnStartup: entry.refreshOnStartup !== false,
 		api: entry.api ?? "",
 		apiKey: entry.apiKey ?? "",
 		name: entry.name ?? "",
@@ -685,7 +662,7 @@ async function readPanelProviders(): Promise<{ providers: PanelProvider[]; error
 
 /**
  * 面板改一个 provider 的字段后写回 models.json。
- * 沿用原条目的其余字段（headers/compat 等面板不管的键），只覆盖面板能改的四项。
+ * 沿用原条目的其余字段（headers/compat 等），只覆盖面板字段。
  */
 async function persistProvider(provider: PanelProvider): Promise<{ backup: string }> {
 	const { data, error } = await readModelsFile();
@@ -694,6 +671,11 @@ async function persistProvider(provider: PanelProvider): Promise<{ backup: strin
 	const existing = providers[provider.id];
 	if (!existing) throw new Error(i18n.t("panelProviderMissing", { id: provider.id }));
 	const entry: Record<string, unknown> = { ...existing, baseUrl: provider.baseUrl, api: provider.api };
+	entry.refreshOnStartup = provider.refreshOnStartup;
+	for (const field of ["modelsUrl", "metadataUrl", "metadataProvider"] as const) {
+		if (provider[field]) entry[field] = provider[field];
+		else delete entry[field];
+	}
 	if (provider.enabled) entry[DISCOVERY_MARKER] = true;
 	else delete entry[DISCOVERY_MARKER];
 	if (provider.apiKey) entry.apiKey = provider.apiKey;
@@ -714,7 +696,11 @@ async function persistNewProvider(provider: PanelProvider): Promise<{ backup: st
 		baseUrl: provider.baseUrl,
 		api: provider.api,
 		[DISCOVERY_MARKER]: true,
+		refreshOnStartup: provider.refreshOnStartup,
 	};
+	for (const field of ["modelsUrl", "metadataUrl", "metadataProvider"] as const) {
+		if (provider[field]) entry[field] = provider[field];
+	}
 	if (provider.apiKey) entry.apiKey = provider.apiKey;
 	if (provider.name) entry.name = provider.name;
 	providers[provider.id] = entry;
@@ -745,8 +731,9 @@ async function reloadProvider(options: {
 	fetchCache: FetchCache;
 	/** 收集过程中产生的提示，由调用方决定发给谁。 */
 	notices: Notice[];
+	sink: NoticeSink;
 }): Promise<void> {
-	const { pi, entry, fetchCache, notices } = options;
+	const { pi, entry, fetchCache, notices, sink } = options;
 	if (entry.discoverModels === false) {
 		pi.unregisterProvider(entry.id);
 		return;
@@ -759,10 +746,10 @@ async function reloadProvider(options: {
 		Array.isArray(cached.models) &&
 		cached.models.length > 0
 	) {
-		registerFromCache(pi, entry, cached, notices);
+		registerFromCache(pi, entry, cached, notices, sink);
 		return;
 	}
-	await discoverAndRegister(pi, entry, fetchCache, notices);
+	await discoverAndRegister(pi, entry, fetchCache, notices, sink);
 }
 
 /** 按 id 从 models.json 现读一个 provider 条目；没有发现标记时返回 undefined。 */
@@ -772,7 +759,7 @@ async function readProviderEntry(id: string): Promise<DiscoveryProviderEntry | u
 }
 
 /** /config:model-discovery 交互式配置命令；旧名称保留为兼容别名。 */
-function registerDiscoveryCommand(pi: ExtensionAPI, fetchCache: FetchCache, sink: NoticeSink) {
+function registerDiscoveryCommand(pi: ExtensionAPI, sink: NoticeSink) {
 	/** 面板读 provider 列表、写回 models.json，并把改动即时注册到运行期。 */
 	const openPanel = async (ctx: CommandCtx): Promise<void> => {
 		const first = await readPanelProviders();
@@ -812,7 +799,7 @@ function registerDiscoveryCommand(pi: ExtensionAPI, fetchCache: FetchCache, sink
 					if (!entry) {
 						pi.unregisterProvider(provider.id);
 					} else {
-						await reloadProvider({ pi, entry, fetchCache, notices });
+						await reloadProvider({ pi, entry, fetchCache: createFetchCache(), notices, sink });
 					}
 					// 面板行上的当前值来自本地副本，网络提示照常发出来，不静默降级。
 					flushNotices(ctx, notices);
@@ -823,7 +810,7 @@ function registerDiscoveryCommand(pi: ExtensionAPI, fetchCache: FetchCache, sink
 			},
 			onProviderAdd: (provider) => {
 				providers = [...providers, provider];
-				enqueue(() => addProviderFromPanel({ pi, ctx, provider, fetchCache, sink }));
+				enqueue(() => addProviderFromPanel({ pi, ctx, provider, fetchCache: createFetchCache(), sink }));
 			},
 			actions: {
 				rediscover: (provider) => {
@@ -832,12 +819,15 @@ function registerDiscoveryCommand(pi: ExtensionAPI, fetchCache: FetchCache, sink
 						const entry = await readProviderEntry(provider.id) ?? {
 							id: provider.id,
 							baseUrl: provider.baseUrl,
+							modelsUrl: provider.modelsUrl || undefined,
+							metadataUrl: provider.metadataUrl || undefined,
+							metadataProvider: provider.metadataProvider || undefined,
 							api: provider.api,
 							apiKey: provider.apiKey || undefined,
 							name: provider.name || undefined,
 						};
 						const notices: Notice[] = [];
-						const result = await discoverAndRegister(pi, entry, fetchCache, notices);
+						const result = await discoverAndRegister(pi, entry, createFetchCache(), notices, sink);
 						flushNotices(ctx, notices);
 						if (result) {
 							sink({ level: "info", message: i18n.t("rediscovered", { id: provider.id, count: result.count }) }, ctx);
@@ -899,11 +889,11 @@ function registerRefreshCommand(pi: ExtensionAPI, sink: NoticeSink) {
 				return;
 			}
 			// 每次刷新用新的请求级缓存：同模型列表 URL 的 provider 仍共享请求，但不复用启动期结果
-			const fetchCache: FetchCache = new Map();
+			const fetchCache = createFetchCache();
 			let ok = 0;
 			for (const entry of providers) {
 				const notices: Notice[] = [];
-				const result = await discoverAndRegister(pi, entry, fetchCache, notices);
+				const result = await discoverAndRegister(pi, entry, fetchCache, notices, sink);
 				for (const notice of notices) sink(notice, ctx);
 				if (result) {
 					sink(
@@ -965,11 +955,16 @@ async function addProviderFromPanel(options: {
 			id: provider.id,
 			name: provider.name || undefined,
 			baseUrl: provider.baseUrl,
+			modelsUrl: provider.modelsUrl || undefined,
+			metadataUrl: provider.metadataUrl || undefined,
+			metadataProvider: provider.metadataProvider || undefined,
+			refreshOnStartup: provider.refreshOnStartup,
 			apiKey: provider.apiKey || undefined,
 			api: provider.api,
 		},
 		fetchCache,
 		notices,
+		sink,
 	);
 	flushNotices(ctx, notices);
 	if (result) {
@@ -984,9 +979,11 @@ export default async function (pi: ExtensionAPI) {
 	installNoticeRenderer(pi);
 	// 加载期没有 ctx，消息统一收集，session_start 时 flush（运行期后续追加的也会在下个 session 补发）
 	const pendingNotices: Notice[] = [];
+	let activeCtx: CommandCtx | undefined;
 	// 有 UI 时走统一来源包装；无 UI 时退到日志前缀，不静默丢掉提示
 	const sink: NoticeSink = (notice, ctx) => {
-		if (ctx) notifyWithSource({ ctx, source: NOTICE_SOURCE, level: notice.level, message: notice.message });
+		const target = ctx ?? activeCtx;
+		if (target) notifyWithSource({ ctx: target, source: NOTICE_SOURCE, level: notice.level, message: notice.message });
 		else pendingNotices.push(notice);
 	};
 	const { data, error } = await readModelsFile();
@@ -994,7 +991,7 @@ export default async function (pi: ExtensionAPI) {
 		pendingNotices.push({ level: "warning", message: `${LOG_PREFIX} ${error}` });
 	}
 	const providers = pickDiscoveryProviders(data);
-	const fetchCache: FetchCache = new Map();
+	const fetchCache = createFetchCache();
 
 	if (providers.length > 0) {
 		const cache = await readCache(pendingNotices);
@@ -1006,18 +1003,31 @@ export default async function (pi: ExtensionAPI) {
 				Array.isArray(cached.models) &&
 				cached.models.length > 0
 			) {
-				registerFromCache(pi, entry, cached, pendingNotices);
+				registerFromCache(pi, entry, cached, pendingNotices, sink);
+				if (entry.refreshOnStartup !== false) await discoverAndRegister(pi, entry, fetchCache, pendingNotices, sink, cached);
 			} else {
-				await discoverAndRegister(pi, entry, fetchCache, pendingNotices);
+				await discoverAndRegister(pi, entry, fetchCache, pendingNotices, sink);
 				// 启动期缓存未命中时保持静默，不打印模型列表
 			}
 		}
 	}
 
-	registerDiscoveryCommand(pi, fetchCache, sink);
+	registerDiscoveryCommand(pi, sink);
 	registerRefreshCommand(pi, sink);
+	registerModelTestCommand(pi, sink, () => activeCtx?.modelRegistry.getAll() ?? [], {
+		getAllTargets: async (ctx) => {
+			const { data, error } = await readModelsFile();
+			if (error) {
+				sink({ level: "error", message: error }, ctx);
+				return [];
+			}
+			const ids = new Set(pickDiscoveryProviders(data).map((entry) => entry.id));
+			return ctx.modelRegistry.getAll().filter((model) => ids.has(model.provider));
+		},
+	});
 
 	pi.on("session_start", (_event, ctx) => {
+		activeCtx = ctx as CommandCtx;
 		for (const notice of pendingNotices.splice(0)) {
 			notifyWithSource({ ctx, source: NOTICE_SOURCE, level: notice.level, message: notice.message });
 		}

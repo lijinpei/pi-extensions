@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
@@ -44,6 +44,8 @@ async function discoveryHarness(t: TestContext, entries?: Array<Record<string, u
 	});
 	const registrations = new Map<string, Parameters<ExtensionAPI["registerProvider"]>[1]>();
 	const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+	const events = new Map<string, (event: unknown, ctx: unknown) => void>();
+	const warnings: string[] = [];
 	const pi: Pick<ExtensionAPI, "registerCommand" | "on"> & {
 		registerProvider(id: string, config: Parameters<ExtensionAPI["registerProvider"]>[1]): void;
 	} = {
@@ -53,13 +55,19 @@ async function discoveryHarness(t: TestContext, entries?: Array<Record<string, u
 		registerCommand: (name, command) => {
 			commands.set(name, command);
 		},
-		on: () => {},
+		on: (name, handler) => { events.set(name, handler as (event: unknown, ctx: unknown) => void); },
 	};
 	return {
 		dir,
 		requests,
 		registrations,
 		commands,
+		warnings: () => {
+			events.get("session_start")?.({}, { ui: { notify: (message: string, level: string) => {
+				if (level === "warning") warnings.push(message);
+			} } });
+			return warnings.splice(0);
+		},
 		configure: (providers: Record<string, unknown>) =>
 			writeFile(join(dir, "models.json"), JSON.stringify({ providers })),
 		start: () => discoveryExtension(pi as ExtensionAPI),
@@ -76,6 +84,7 @@ const discoveryProvider = {
 	baseUrl: "https://api.example.com/v1///",
 	api: "openai-completions",
 	discoverModels: true,
+	refreshOnStartup: false,
 };
 
 test("discovery defaults to baseUrl/models when modelsUrl is absent or empty", async (t) => {
@@ -269,7 +278,7 @@ test("discovery maps advertised image and reasoning capabilities, preserving exp
 		{ id: "disabled", capabilities: { image_input: { supported: false }, thinking: { supported: false } } },
 		{ id: "explicit", input: ["text"], reasoning: false, capabilities: { vision: true, thinking: { supported: true } } },
 		{ id: "image-only", input: ["image", "audio"], capabilities: { vision: false } },
-		{ id: "unknown" },
+		{ id: "unknown", mode: "custom-conversational-mode" },
 	]);
 	await h.configure({ foo: discoveryProvider });
 	await h.start();
@@ -671,4 +680,262 @@ test("cached thinking metadata is revalidated and caches without it keep conserv
 		assert.deepEqual(models.map((m) => m.thinkingLevelMap), [{ xhigh: null, max: null }, { xhigh: null, max: null }]);
 	}
 	assert.equal(h.requests.length, 0);
+});
+
+const metadataUrl = "https://catalog.example.com/models.json";
+const canonicalCatalog = () => ({
+	origin: { models: {
+		known: { id: "known", name: "Known model", reasoning: false, limit: { context: 128_000, output: 8192 },
+			modalities: { input: ["text", "image"] }, cost: { input: 1, output: 2, cache_read: 0.1, cache_write: 0.2 },
+			thinkingLevelMap: { max: "max" } },
+		unavailable: { id: "unavailable", name: "Not offered by this endpoint" },
+	} },
+});
+
+test("catalog metadata enriches only endpoint-listed models and never leaks provider credentials", async (t) => {
+	const h = await discoveryHarness(t);
+	const requests: Array<{ url: string; init: RequestInit }> = [];
+	t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+		requests.push({ url, init });
+		return Response.json(url === metadataUrl ? canonicalCatalog() : { data: [{ id: "known" }, { id: "custom" }] });
+	});
+	await h.configure({ proxy: { ...discoveryProvider, metadataUrl, metadataProvider: "origin",
+		apiKey: "private-test-key", headers: { "X-Private": "private-test-value" } } });
+	await h.start();
+	const config = h.registrations.get("proxy")!;
+	assert.deepEqual(config.models!.map((model) => model.id), ["known", "custom"]);
+	const model = config.models![0];
+	assert.equal(model.name, "Known model");
+	assert.equal(model.contextWindow, 128_000);
+	assert.equal(model.maxTokens, 8192);
+	assert.equal(model.reasoning, false);
+	assert.deepEqual(model.input, ["text", "image"]);
+	assert.deepEqual(model.cost, { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 0.2 });
+	assert.deepEqual(model.thinkingLevelMap, { xhigh: null, max: null }, "catalog tiers do not prove gateway support");
+	assert.equal(config.models![1].contextWindow, 1_000_000, "unknown endpoint models remain available");
+	assert.equal(requests[0].init.headers["Authorization"], "Bearer private-test-key");
+	assert.equal(requests[1].init.headers, undefined, "catalog requests must not inherit provider auth or headers");
+	assert.ok(requests.every((request) => request.init.signal instanceof AbortSignal));
+	assert.equal("metadataUrl" in config, false);
+	assert.equal("metadataProvider" in config, false);
+	await h.start();
+	assert.deepEqual(h.registrations.get("proxy")!.models, config.models);
+	assert.deepEqual(await h.registrations.get("proxy")!.refreshModels!(refreshContext(false)), config.models);
+	assert.equal(requests.length, 2, "both enriched and unknown models survive offline startup");
+});
+
+test("endpoint metadata wins field by field, including false, text-only input and zero prices", async (t) => {
+	const h = await discoveryHarness(t);
+	t.mock.method(globalThis, "fetch", async (url: string) => Response.json(url === metadataUrl ? {
+		data: [{ id: "known", name: "Catalog", reasoning: true, input: ["text", "image"], max_tokens: 8192,
+			context_window: 256_000, cost: { input: 9, output: 10, cacheRead: 1, cacheWrite: 2 } }],
+	} : [{ id: "known", name: "Endpoint", reasoning: false, input: ["text"], max_tokens: 4096,
+		context_window: 0, cost: { input: 0, cacheRead: 0 }, thinkingLevelMap: { max: "maximum" } }]));
+	await h.configure({ proxy: { ...discoveryProvider, metadataUrl } });
+	await h.start();
+	const model = h.registrations.get("proxy")!.models![0];
+	assert.equal(model.name, "Endpoint");
+	assert.equal(model.reasoning, false);
+	assert.deepEqual(model.input, ["text"]);
+	assert.equal(model.contextWindow, 256_000);
+	assert.equal(model.maxTokens, 4096);
+	assert.deepEqual(model.cost, { input: 0, output: 10, cacheRead: 0, cacheWrite: 2 });
+	assert.equal(model.thinkingLevelMap?.max, "maximum");
+});
+
+test("metadata requests are shared while provider-specific catalog matches stay isolated", async (t) => {
+	const h = await discoveryHarness(t);
+	const requests: string[] = [];
+	t.mock.method(globalThis, "fetch", async (url: string) => {
+		requests.push(url);
+		return Response.json(url === metadataUrl ? {
+			one: { models: { shared: { id: "shared", limit: { context: 100_000 }, cost: { input: 1 } } } },
+			two: { models: { shared: { id: "shared", limit: { context: 200_000 }, cost: { input: 2 } } } },
+		} : { data: [{ id: "shared" }] });
+	});
+	await h.configure({
+		one: { ...discoveryProvider, metadataUrl },
+		two: { ...discoveryProvider, metadataUrl },
+		proxy: { ...discoveryProvider, metadataUrl, metadataProvider: "one" },
+	});
+	await h.start();
+	assert.equal(requests.filter((url) => url === metadataUrl).length, 1);
+	assert.deepEqual([...h.registrations.values()].map((config) => config.models![0].contextWindow), [100_000, 200_000, 100_000]);
+	assert.deepEqual([...h.registrations.values()].map((config) => config.models![0].cost.input), [1, 2, 1]);
+});
+
+test("catalog failures warn without preventing endpoint model registration and recover on refresh", async (t) => {
+	const h = await discoveryHarness(t);
+	let catalogResponse = new Response(null, { status: 503 });
+	t.mock.method(globalThis, "fetch", async (url: string) => url === metadataUrl ? catalogResponse.clone()
+		: Response.json({ data: [{ id: "known", max_tokens: 2048 }] }));
+	await h.configure({ proxy: { ...discoveryProvider, metadataUrl, metadataProvider: "origin" } });
+	for (const response of [new Response(null, { status: 503 }), Response.json({ error: "invalid shape" }), new Response("invalid json")]) {
+		catalogResponse = response;
+		await rm(join(h.dir, "extensions"), { recursive: true, force: true });
+		await h.start();
+		const model = h.registrations.get("proxy")!.models![0];
+		assert.equal(model.id, "known");
+		assert.equal(model.maxTokens, 2048);
+		assert.equal(model.contextWindow, 1_000_000);
+		assert.equal(h.warnings().length, 1);
+	}
+	catalogResponse = Response.json(canonicalCatalog());
+	const models = await h.registrations.get("proxy")!.refreshModels!(refreshContext(true));
+	assert.equal(models[0].contextWindow, 128_000);
+	assert.equal(models[0].maxTokens, 2048);
+});
+
+test("metadata cannot supply availability when the provider endpoint fails or is empty", async (t) => {
+	const h = await discoveryHarness(t);
+	const requests: string[] = [];
+	let endpointResponse = new Response(null, { status: 401 });
+	t.mock.method(globalThis, "fetch", async (url: string) => {
+		requests.push(url);
+		return url === metadataUrl ? Response.json(canonicalCatalog()) : endpointResponse.clone();
+	});
+	await h.configure({ proxy: { ...discoveryProvider, metadataUrl, models: [{ id: "handwritten" }] } });
+	for (const response of [new Response(null, { status: 401 }), Response.json({ data: [] })]) {
+		endpointResponse = response;
+		await h.start();
+		assert.equal(h.registrations.get("proxy")!.models, undefined, "preserve handwritten fallback without registering catalog models");
+		await assert.rejects(() => h.registrations.get("proxy")!.refreshModels!(refreshContext(false)));
+	}
+	assert.equal(requests.includes(metadataUrl), false, "metadata is only requested after availability is confirmed");
+});
+
+test("catalog source changes invalidate persistent caches and online refresh reloads both sources", async (t) => {
+	const h = await discoveryHarness(t);
+	const requests: string[] = [];
+	let contextWindow = 128_000;
+	t.mock.method(globalThis, "fetch", async (url: string) => {
+		requests.push(url);
+		return Response.json(url.includes("catalog.example.com") ? {
+			one: { models: { known: { id: "known", limit: { context: contextWindow } } } },
+			two: { models: { known: { id: "known", limit: { context: contextWindow * 2 } } } },
+		} : { data: [{ id: "known" }] });
+	});
+	for (const options of [{}, { metadataUrl, metadataProvider: "one" },
+		{ metadataUrl, metadataProvider: "two" }, { metadataUrl: `${metadataUrl}?revision=2`, metadataProvider: "two" }, {}]) {
+		await h.configure({ proxy: { ...discoveryProvider, ...options } });
+		const before = requests.length;
+		await h.start();
+		assert.equal(requests.length - before, "metadataUrl" in options ? 2 : 1);
+		await h.start();
+		assert.equal(requests.length - before, "metadataUrl" in options ? 2 : 1, "unchanged config reuses cache");
+	}
+	await h.configure({ proxy: { ...discoveryProvider, metadataUrl, metadataProvider: "one" } });
+	await h.start();
+	contextWindow = 256_000;
+	const before = requests.length;
+	const models = await h.registrations.get("proxy")!.refreshModels!(refreshContext(true));
+	assert.equal(models[0].contextWindow, 256_000);
+	assert.equal(requests.length - before, 2);
+});
+
+test("invalid metadata URLs warn and keep endpoint discovery without a catalog request", async (t) => {
+	const h = await discoveryHarness(t, [{ id: "known" }]);
+	for (const url of ["file:///catalog.json", "https://user:password@catalog.example.com/models", "invalid"]) {
+		await h.configure({ proxy: { ...discoveryProvider, metadataUrl: url } });
+		await h.start();
+		assert.equal(h.registrations.get("proxy")!.models![0].id, "known");
+		assert.equal(h.warnings().length, 1);
+	}
+	assert.equal(h.requests.length, 3, "only the endpoint model-list requests are sent");
+});
+
+test("model-picker refresh reports catalog failures immediately in the active session", async (t) => {
+	const h = await discoveryHarness(t);
+	let failCatalog = false;
+	t.mock.method(globalThis, "fetch", async (url: string) => url === metadataUrl
+		? failCatalog ? new Response(null, { status: 503 }) : Response.json(canonicalCatalog())
+		: Response.json({ data: [{ id: "known" }] }));
+	await h.configure({ proxy: { ...discoveryProvider, metadataUrl, metadataProvider: "origin" } });
+	await h.start();
+	assert.deepEqual(h.warnings(), [], "establish an active session without startup warnings");
+	failCatalog = true;
+	assert.equal((await h.registrations.get("proxy")!.refreshModels!(refreshContext(true)))[0].id, "known");
+	assert.equal(h.warnings().length, 1, "refresh warnings must be delivered even after the startup queue has been flushed");
+});
+
+test("startup refresh defaults on, updates saved metadata and keeps cached models when the gateway fails", async (t) => {
+	const h = await discoveryHarness(t);
+	let contextWindow = 128_000;
+	let gatewayDown = false;
+	const urls: string[] = [];
+	t.mock.method(globalThis, "fetch", async (url: string) => {
+		urls.push(url);
+		if (gatewayDown && url !== metadataUrl) throw new Error("gateway offline");
+		return Response.json(url === metadataUrl ? { origin: { models: { known: { limit: { context: contextWindow } } } } }
+			: { data: [{ id: "known" }] });
+	});
+	await h.configure({ proxy: { ...discoveryProvider, refreshOnStartup: undefined, metadataUrl, metadataProvider: "origin", apiKey: "test-key" } });
+	const original = await readFile(join(h.dir, "models.json"), "utf-8");
+	await h.start();
+	contextWindow = 256_000;
+	await h.start();
+	assert.equal(h.registrations.get("proxy")!.models![0].contextWindow, 256_000);
+	assert.equal(urls.length, 4, "refresh both sources even with an unchanged fingerprint");
+	const saved = JSON.parse(await readFile(join(h.dir, "extensions/pi-models-discovery/metadata.json"), "utf-8"));
+	assert.equal(saved.sources[metadataUrl].providers.origin.models.known.contextWindow, 256_000);
+	assert.ok(!JSON.stringify(saved).includes("test-key"));
+	assert.ok(!Number.isNaN(Date.parse(saved.sources[metadataUrl].fetchedAt)));
+	gatewayDown = true;
+	await h.start();
+	const config = h.registrations.get("proxy")!;
+	assert.equal(config.models![0].contextWindow, 256_000);
+	assert.deepEqual(await config.refreshModels!(refreshContext(true)), config.models, "picker refresh failure must retain usable models");
+	assert.ok(h.warnings().length >= 2);
+	assert.equal(await readFile(join(h.dir, "models.json"), "utf-8"), original, "automatic refresh must not rewrite gateway configuration");
+	assert.ok(h.commands.has("model_test"));
+	assert.ok(!h.commands.has("model"), "Pi owns the built-in picker");
+});
+
+test("saved catalog enriches new endpoint models when metadata is offline and never crosses source URLs", async (t) => {
+	const h = await discoveryHarness(t);
+	let metadataDown = false;
+	let list = [{ id: "known" }];
+	t.mock.method(globalThis, "fetch", async (url: string) => {
+		if (url.startsWith(metadataUrl)) {
+			if (metadataDown) throw new Error("catalog offline");
+			return Response.json({ origin: { models: { known: { limit: { context: 128_000 } }, later: { limit: { context: 256_000 } } } } });
+		}
+		return Response.json({ data: list });
+	});
+	await h.configure({ proxy: { ...discoveryProvider, metadataUrl, metadataProvider: "origin" } });
+	await h.start();
+	metadataDown = true;
+	list.push({ id: "later" });
+	let models = await h.registrations.get("proxy")!.refreshModels!(refreshContext(true));
+	assert.deepEqual(models.map((model) => model.contextWindow), [128_000, 256_000]);
+	assert.equal(h.warnings().length, 1);
+	await h.configure({ proxy: { ...discoveryProvider, metadataUrl: `${metadataUrl}?other-source`, metadataProvider: "origin" } });
+	await h.start();
+	models = h.registrations.get("proxy")!.models!;
+	assert.deepEqual(models.map((model) => model.contextWindow), [1_000_000, 1_000_000]);
+});
+
+test("only conversational models register and Responses-only models preserve their protocol through Pi and cache", async (t) => {
+	const h = await discoveryHarness(t, [
+		{ id: "embedding", mode: "embedding", capabilities: { chat: false, responses: false, embedding: true } },
+		{ id: "chat", mode: "chat", capabilities: { chat: true, responses: true } },
+		{ id: "responses", mode: "chat", capabilities: { chat: false, responses: true, effort: { max: true } } },
+		{ id: "image-generation", mode: "image_generation" },
+		{ id: "unknown" },
+		{ id: "chat" },
+	]);
+	await h.configure({ gateway: { ...discoveryProvider, apiKey: "test-key" } });
+	await h.start();
+	const config = h.registrations.get("gateway")!;
+	assert.deepEqual(config.models!.map((model) => model.id), ["chat", "responses", "unknown"]);
+	const registry = await piRegistry(h);
+	assert.equal(registry.find("gateway", "chat")!.api, "openai-completions");
+	assert.equal(registry.find("gateway", "responses")!.api, "openai-responses");
+	assert.equal(registry.find("gateway", "responses")!.thinkingLevelMap.max, "max");
+	assert.ok(registry.getAvailable().some((model) => model.provider === "gateway" && model.id === "responses"));
+	assert.equal((await registry.getApiKeyAndHeaders(registry.find("gateway", "responses")!)).ok, true);
+	await h.start();
+	assert.equal(h.requests.length, 1);
+	assert.equal(h.registrations.get("gateway")!.models!.find((model) => model.id === "responses")!.api, "openai-responses");
+	assert.equal(h.registrations.get("gateway")!.models!.find((model) => model.id === "responses")!.thinkingLevelMap.max, "max");
 });

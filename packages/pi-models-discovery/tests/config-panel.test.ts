@@ -11,6 +11,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { ENTER, press } from "./panel-driver.ts";
 import {
 	API_CHOICES,
 	PANEL_FIELD_IDS,
@@ -31,13 +32,8 @@ const i18n = createTranslator(loadCatalog(new URL("../locales/index.json", impor
 
 /** 面板里每个 provider 能够改动的字段名（与旧 select/input/confirm 流程一一对应）。 */
 const PROVIDER_EDITABLE_FIELDS: readonly string[] = [
-	"enabled",
-	"name",
-	"baseUrl",
-	"api",
-	"apiKey",
-	"rediscover",
-	"remove",
+	...Object.keys(customProvider()).filter((field) => field !== "id"),
+	"rediscover", "remove",
 ];
 
 /** 一个非默认值的 provider，避免往返测试因为值恰好等于默认值而蒙混过关。 */
@@ -45,6 +41,10 @@ function customProvider(): PanelProvider {
 	return {
 		id: "llm-proxy",
 		baseUrl: "http://127.0.0.1:9000/pi/v1",
+		modelsUrl: "https://api.example.com/v1/models",
+		metadataUrl: "https://models.dev/api.json",
+		metadataProvider: "anthropic",
+		refreshOnStartup: true,
 		api: "anthropic-messages",
 		apiKey: "$PROXY_KEY",
 		name: "Proxy",
@@ -81,12 +81,24 @@ test("顶层列出每个 provider，并带「添加 provider」入口", () => {
 });
 
 test("取当前显示值写回，每个可编辑字段都能往返一致", () => {
-	const provider = customProvider();
-	for (const item of buildProviderItems(provider)) {
-		if (item.id === PROVIDER_FIELD.rediscover || item.id === PROVIDER_FIELD.remove) continue;
-		const next = applyProviderChange(provider, item.id, item.currentValue);
-		assert.notEqual(next, undefined, `${item.id} 拒绝了自己的当前值`);
-		assert.deepEqual(next, provider, `${item.id} 没有往返一致`);
+	for (const provider of [customProvider(), { ...customProvider(), refreshOnStartup: false, name: "", apiKey: "", modelsUrl: "", metadataUrl: "", metadataProvider: "" }]) {
+		for (const item of buildProviderItems(provider)) {
+			if (item.id === PROVIDER_FIELD.rediscover || item.id === PROVIDER_FIELD.remove) continue;
+			const next = applyProviderChange(provider, item.id, item.currentValue);
+			assert.notEqual(next, undefined, `${item.id} 拒绝了自己的当前值`);
+			assert.deepEqual(next, provider, `${item.id} 没有往返一致`);
+		}
+	}
+});
+
+test("empty text submenus return their displayed label and round-trip empty configuration values", () => {
+	const provider = { ...customProvider(), name: "", apiKey: "", modelsUrl: "", metadataUrl: "", metadataProvider: "" };
+	for (const item of buildProviderItems(provider).filter((row) => ["name", "apiKey", "modelsUrl", "metadataUrl", "metadataProvider"].includes(row.id))) {
+		let result: string | undefined;
+		const submenu = item.submenu!(item.currentValue, (value) => { result = value; });
+		press(submenu, [ENTER]);
+		assert.equal(result, item.currentValue);
+		assert.deepEqual(applyProviderChange(provider, item.id, result!), provider);
 	}
 });
 

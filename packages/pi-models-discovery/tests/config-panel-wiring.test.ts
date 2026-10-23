@@ -10,12 +10,12 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { initTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { ENTER } from "./panel-driver.ts";
+import { ENTER, down } from "./panel-driver.ts";
 import { createScriptedUi } from "./panel-driver.ts";
 
 /** 配置命令处理器的读形态。 */
@@ -92,4 +92,71 @@ test("不带参数的配置命令打开面板，关掉发现开关会去掉标�
 	assert.equal(saved.providers.demo?.baseUrl, "http://127.0.0.1:1/v1");
 	assert.equal(saved.providers.demo?.api, "openai-completions");
 	assert.deepEqual(unregistered, ["demo"], "关掉发现后应注销该 provider");
+});
+
+test("metadata settings apply immediately and rediscovery reloads catalog and endpoint models", async (t) => {
+	initTheme("dark");
+	const agentDir = await mkdtemp(join(tmpdir(), "pi-models-discovery-metadata-panel-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	t.after(async () => {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		await rm(agentDir, { recursive: true, force: true });
+	});
+	const modelsUrl = "https://api.example.com/catalog";
+	const metadataUrl = "https://catalog.example.com/metadata";
+	let contextWindow = 128_000;
+	const requests: string[] = [];
+	t.mock.method(globalThis, "fetch", async (url: string) => {
+		requests.push(url);
+		return Response.json(url === metadataUrl ? {
+			origin: { models: { known: { id: "known", limit: { context: contextWindow } } } },
+		} : { data: [{ id: "known" }] });
+	});
+	const modelsPath = join(agentDir, "models.json");
+	await writeFile(modelsPath, JSON.stringify({ providers: { demo: {
+		baseUrl: "https://api.example.com/v1", modelsUrl, api: "openai-completions", discoverModels: true,
+		metadataProvider: "origin", headers: { "X-Test": "test" }, compat: { supportsDeveloperRole: true },
+	} } }));
+	const commands = new Map<string, RegisteredCommand>();
+	const registrations = new Map<string, Parameters<ExtensionAPI["registerProvider"]>[1]>();
+	const pi = {
+		registerCommand: (name: string, command: RegisteredCommand) => commands.set(name, command),
+		registerProvider: (id: string, config: Parameters<ExtensionAPI["registerProvider"]>[1]) => registrations.set(id, config),
+		unregisterProvider: () => undefined,
+		registerEntryRenderer: () => undefined,
+		on: () => undefined,
+	} as unknown as ExtensionAPI;
+	const { default: discovery } = await import("../src/index.ts");
+	await discovery(pi);
+	assert.equal(registrations.get("demo")!.models![0].contextWindow, 1_000_000);
+	const command = commands.get("config:model-discovery")!;
+	const runPanel = async (scripts: string[][]) => {
+		const ui = createScriptedUi(scripts);
+		await command.handler("", { hasUI: true, ui: { custom: ui.custom, notify: () => undefined, confirm: async () => false } });
+	};
+	await runPanel([[ENTER], [...down(5), ENTER, metadataUrl, ENTER, "\u001B"]]);
+	assert.equal(registrations.get("demo")!.models![0].contextWindow, 128_000, "new source takes effect immediately");
+	assert.deepEqual(requests, [modelsUrl, modelsUrl, metadataUrl]);
+	const saved = JSON.parse(await readFile(modelsPath, "utf8"));
+	assert.equal(saved.providers.demo.metadataUrl, metadataUrl);
+	assert.equal(saved.providers.demo.modelsUrl, modelsUrl);
+	assert.equal(saved.providers.demo.metadataProvider, "origin");
+	assert.deepEqual(saved.providers.demo.headers, { "X-Test": "test" });
+	assert.deepEqual(saved.providers.demo.compat, { supportsDeveloperRole: true });
+
+	contextWindow = 256_000;
+	await runPanel([[ENTER], [...down(9), ENTER]]);
+	assert.equal(registrations.get("demo")!.models![0].contextWindow, 256_000, "rediscovery must bypass startup request cache");
+	assert.deepEqual(requests.slice(-2), [modelsUrl, metadataUrl]);
+
+	await runPanel([[ENTER], [...down(5), ENTER, "\u0001", "\u000B", ENTER, "\u001B"]]);
+	assert.equal(JSON.parse(await readFile(modelsPath, "utf8")).providers.demo.metadataUrl, undefined);
+	assert.equal(registrations.get("demo")!.models![0].contextWindow, 1_000_000, "clearing source removes catalog enrichment immediately");
+	assert.equal(requests.at(-1), modelsUrl);
+	const beforeToggle = requests.length;
+	await runPanel([[ENTER], [...down(1), " ", "\u001B"]]);
+	assert.equal(JSON.parse(await readFile(modelsPath, "utf8")).providers.demo.refreshOnStartup, false);
+	assert.equal(requests.length, beforeToggle, "changing the startup policy must not discard an otherwise valid cache");
 });

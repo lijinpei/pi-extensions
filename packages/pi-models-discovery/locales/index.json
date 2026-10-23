@@ -4,8 +4,8 @@
     "en-US": "Interactively manage model-discovery providers (add/remove/rediscover); changes are written to models.json and take effect immediately"
   },
   "refreshDescription": {
-    "zh-CN": "强制重新拉取所有模型发现 provider 的模型列表并更新本地缓存（启动时默认走缓存，不请求网络）",
-    "en-US": "Force rediscovery of all model-discovery providers and update the local cache (startup uses the cache and performs no network requests by default)"
+    "zh-CN": "强制刷新网关模型列表、元数据 JSON 和本地缓存",
+    "en-US": "Refresh gateway models, metadata JSON and the local cache"
   },
   "refreshEmpty": {
     "zh-CN": "models.json 中没有标记 discoverModels 的 provider，可用 /config:model-discovery 添加",
@@ -60,8 +60,8 @@
     "en-US": "Missing {field}; cannot register model discovery"
   },
   "discoveryFailed": {
-    "zh-CN": "{id}: 模型发现失败（{reason}），该 provider 暂用 models.json 手写 models 或无可用模型",
-    "en-US": "{id}: model discovery failed ({reason}); falling back to handwritten models in models.json, or no models available"
+    "zh-CN": "{id}: 模型发现失败（{reason}）；保留匹配配置的缓存或 models.json 手写模型",
+    "en-US": "{id}: model discovery failed ({reason}); keeping matching cached models or handwritten models in models.json"
   },
   "discoveredInfo": {
     "zh-CN": "{id}: 发现 {count} 个模型（{models}）",
@@ -286,5 +286,109 @@
   "panelProviderMissing": {
     "zh-CN": "models.json 中找不到 provider「{id}」的条目，无法写回。",
     "en-US": "models.json has no entry for provider \"{id}\"; the change cannot be written back."
+  },
+  "invalidMetadataUrl": {
+    "zh-CN": "元数据 URL 必须使用 HTTP(S)，且不能包含用户名或密码",
+    "en-US": "Metadata URL must use HTTP(S) and contain no username or password"
+  },
+  "invalidMetadataCatalog": {
+    "zh-CN": "元数据响应不是有效的模型列表或 models.dev 目录",
+    "en-US": "Metadata response is not a valid model list or models.dev catalog"
+  },
+  "metadataFailed": {
+    "zh-CN": "{id}: 元数据查询失败（{reason}）；继续使用端点元数据和默认值",
+    "en-US": "{id}: metadata lookup failed ({reason}); continuing with endpoint metadata and defaults"
+  },
+  "panelLabelModelsUrl": {
+    "zh-CN": "模型列表 URL",
+    "en-US": "Model-list URL"
+  },
+  "panelDescModelsUrl": {
+    "zh-CN": "可选的完整模型列表 URL；留空使用 baseUrl 下的 /models。该列表决定可用模型。",
+    "en-US": "Optional complete model-list URL; empty uses /models under baseUrl. This list determines available models."
+  },
+  "panelLabelMetadataUrl": {
+    "zh-CN": "元数据 URL",
+    "en-US": "Metadata URL"
+  },
+  "panelDescMetadataUrl": {
+    "zh-CN": "用 https://models.dev/api.json 或模型列表 API 补齐元数据；留空关闭。不会发送 provider 的凭证。",
+    "en-US": "Fill metadata gaps using https://models.dev/api.json or a model-list API; empty disables lookup. Provider credentials are never sent."
+  },
+  "panelLabelMetadataProvider": {
+    "zh-CN": "元数据 provider",
+    "en-US": "Metadata provider"
+  },
+  "panelDescMetadataProvider": {
+    "zh-CN": "可选的 models.dev provider id（如 anthropic），用于确定模型元数据来源；留空按精确 ID 匹配。",
+    "en-US": "Optional models.dev provider id (such as anthropic) to select the metadata source; empty uses exact ID matching."
+  },
+  "metadataWriteFailed": {
+    "zh-CN": "模型元数据 JSON 写入失败：{reason}",
+    "en-US": "Failed to write model metadata JSON: {reason}"
+  },
+  "metadataCached": {
+    "zh-CN": "元数据刷新失败（{reason}）；使用 metadata.json 中的上次成功目录",
+    "en-US": "Metadata refresh failed ({reason}); using the last successful catalog from metadata.json"
+  },
+  "panelLabelRefreshOnStartup": {
+    "zh-CN": "启动时刷新",
+    "en-US": "Refresh on startup"
+  },
+  "panelDescRefreshOnStartup": {
+    "zh-CN": "每次启动刷新模型列表和元数据；失败保留缓存。关闭后仅在缓存缺失或手动刷新时联网。",
+    "en-US": "Refresh models and metadata on each startup; retain cached data on failure. Turn off to use cached startup until an explicit refresh."
+  },
+  "modelTestDescription": {
+    "zh-CN": "测试当前模型或指定 provider/model；provider/* 或 all 逐个测试（会发送小型真实请求）",
+    "en-US": "Test the current model or provider/model; provider/* or all tests sequentially (sends small real requests)"
+  },
+  "modelTestPrompt": {
+    "zh-CN": "请仅回复 OK。",
+    "en-US": "Reply with only OK."
+  },
+  "modelTestTimeout": {
+    "zh-CN": "模型测试超过时间限制",
+    "en-US": "Model test exceeded its time limit"
+  },
+  "modelTestAborted": {
+    "zh-CN": "模型测试已取消",
+    "en-US": "Model test cancelled"
+  },
+  "modelTestAuthFailed": {
+    "zh-CN": "模型测试鉴权失败：{reason}",
+    "en-US": "Model test authentication failed: {reason}"
+  },
+  "modelTestResponseFailed": {
+    "zh-CN": "模型请求失败",
+    "en-US": "Model request failed"
+  },
+  "modelTestEmptyReply": {
+    "zh-CN": "模型返回空文本；未确认可用",
+    "en-US": "Model returned no text; availability was not confirmed"
+  },
+  "modelTestRunning": {
+    "zh-CN": "已有模型测试正在运行",
+    "en-US": "A model test is already running"
+  },
+  "modelTestNoTarget": {
+    "zh-CN": "找不到唯一模型或 provider：{target}。用 /model 选择模型，或 /model_test provider/model、provider/*、all。",
+    "en-US": "No unique model or provider found: {target}. Select a model with /model, or use /model_test provider/model, provider/*, all."
+  },
+  "modelTestStarted": {
+    "zh-CN": "正在测试 {count} 个模型（每次请求最多 64 个输出 token，超时 30 秒）",
+    "en-US": "Testing {count} models (up to 64 output tokens and 30 seconds per request)"
+  },
+  "modelTestPassed": {
+    "zh-CN": "通过 {model} · {api} · {elapsed} 毫秒",
+    "en-US": "PASS {model} · {api} · {elapsed} ms"
+  },
+  "modelTestFailed": {
+    "zh-CN": "失败 {model} · {api} · {elapsed} 毫秒：{reason}",
+    "en-US": "FAIL {model} · {api} · {elapsed} ms: {reason}"
+  },
+  "modelTestSummary": {
+    "zh-CN": "模型测试完成：{passed} 个通过，已测试 {tested}/{total} 个",
+    "en-US": "Model test finished: {passed} passed; {tested}/{total} tested"
   }
 }
