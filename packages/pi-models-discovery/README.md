@@ -114,9 +114,9 @@ The plugin requests the gateway's `/models` list, then uses metadata for matchin
 | `metadataUrl` | Complete HTTP(S) catalog URL. Empty or omitted disables lookup and preserves endpoint-only discovery. Accepts the models.dev provider/model map, a model array, or `{ "data": [...] }` from a model-list API. Requests have a 5-second timeout. |
 | `metadataProvider` | Optional exact provider ID in a models.dev catalog, such as `anthropic` or `openai`. Selects that provider only. It does not affect flat model-list catalogs. |
 
-Without `metadataProvider`, matching tries the configured provider's exact ID, then a provider-qualified model ID (`anthropic/claude-sonnet-4-6`), then an exact model ID that appears in only one catalog provider. Ambiguous matches keep endpoint metadata and defaults; set `metadataProvider` to resolve them. Matching is case-sensitive and does not guess aliases, version suffixes or `latest` names. Chat requests keep the model ID returned by the endpoint.
+Without `metadataProvider`, matching tries the configured provider's exact ID, then a provider-qualified model ID (`anthropic/claude-sonnet-4-6`), then an exact model ID that appears in only one catalog provider. Ambiguous matches keep endpoint metadata and defaults; set `metadataProvider` to resolve them. Exact IDs take precedence. In a selected `anthropic` namespace (`metadataProvider: "anthropic"`, provider ID `anthropic`, or an `anthropic/`-qualified ID), Claude family IDs also match case differences and dots versus hyphens in numeric versions: `Claude-Sonnet-4.6` matches `claude-sonnet-4-6`. Versions and date suffixes are retained; ambiguous normalized matches are ignored. Other providers and flat catalogs keep exact matching. Chat requests keep the model ID returned by the endpoint.
 
-**Precedence:** Pi's `modelOverrides` and the existing provider thinking configuration apply as before. For metadata fields, valid endpoint values win over catalog values, which win over defaults. Explicit `false` and zero prices are preserved, and prices merge per field. Catalog prices describe the selected catalog provider; a gateway may charge differently, so use endpoint pricing or `modelOverrides` for its actual rates. Extra thinking tiers come only from endpoint declarations or explicit overrides, since catalog capabilities do not establish gateway support.
+**Precedence:** Pi's `modelOverrides` and the existing provider thinking configuration apply as before. For metadata fields, valid endpoint values win over catalog values, which win over defaults. Explicit `false` and zero prices are preserved, and prices merge per field. Catalog prices describe the selected catalog provider; a gateway may charge differently, so use endpoint pricing or `modelOverrides` for its actual rates. Endpoint `reasoning_options` take precedence over catalog controls. Missing controls can come from models.dev and enable extra thinking tiers; endpoint effort capabilities, explicit maps and your overrides still take precedence. The catalog describes the selected provider's controls; test actual gateway requests before relying on them.
 
 Catalog requests never inherit the provider's API key or headers. A separate catalog API must permit unauthenticated reads. Lookup errors produce a warning and use the saved catalog when available; endpoint discovery remains usable. If the endpoint fails or returns an empty list, catalog entries cannot establish availability and matching cached models or the handwritten-model fallback apply. Availability means the endpoint advertises a model; discovery does not issue billable completion probes.
 
@@ -163,7 +163,7 @@ Tests make real requests and may incur gateway charges. Discovery itself only re
 - **Offline / fetch failure**: matching cached models are retained, or handwritten `models` in models.json (if any) are kept as a fallback, and an explicit warning is surfaced via in-session notify — never a silent degradation. One provider failing does not affect the others.
 - **apiKey resolution** (discovery request only): supports literals and `$ENV_VAR` / `${ENV_VAR}` interpolation; `!command` values skip discovery with an explicit warning (chat requests are still resolved by pi itself and are unaffected).
 - When both endpoint and configured catalog metadata are absent, discovered models default to `reasoning: true`, `input: ["text", "image"]`, zero cost, `contextWindow` 1M, `maxTokens` 64K, and `compat.supportsDeveloperRole: false`. Advertised metadata replaces these defaults as described below. Provider-level `compat` is merged into every discovered model.
-- Discovered models default `thinkingLevelMap.xhigh` / `max` to `null`; extra tiers are no longer assumed to work on every backend. Standard tiers keep Pi's default mapping. Thinking metadata advertised by the model list can enable or hide tiers per model (see [Thinking levels](#thinking-levels)). Opt in with provider-level `compat.thinkingLevelMap` when the service supports extra tiers, or set any unsupported tier to `null`.
+- Discovered models default `thinkingLevelMap.xhigh` / `max` to `null`; extra tiers are no longer assumed to work on every backend. Standard tiers keep Pi's default mapping. Endpoint thinking metadata and matching catalog `reasoning_options` can enable or hide tiers per model (see [Thinking levels](#thinking-levels)). Opt in with provider-level `compat.thinkingLevelMap` when the service supports extra tiers, or set any unsupported tier to `null`.
 - For non-reasoning models, set provider-level `compat.reasoning: false` so `/thinking` offers only `off`. `reasoning` and `thinkingLevelMap` are extracted to the model's top level; other `compat` fields (such as `supportsReasoningEffort` and `thinkingFormat`) are forwarded normally. Mixed-model gateways can use `modelOverrides` by model.id. Existing caches apply the current thinking configuration at startup without a network refresh.
 
 Example for a local non-reasoning service. To enable verified extra tiers instead, use `"thinkingLevelMap": { "xhigh": "xhigh", "max": "max" }` and remove `"reasoning": false`.
@@ -218,9 +218,26 @@ Startup refresh replaces older cached defaults with advertised metadata. Use `/c
 
 ### Thinking levels
 
-A model entry can advertise its thinking levels in two ways.
+A model entry can advertise its thinking controls in three ways. The plugin saves these declarations in both metadata and model caches and rebuilds the final map at startup.
 
 **Explicit map.** `thinkingLevelMap`, then `thinking_level_map`, uses Pi's format. The first alias with at least one valid entry is used as a whole; aliases are not merged. Keys must be `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Values must be nonempty strings (the value sent to the backend) or `null` (hidden). Other entries are ignored.
+
+**models.dev controls.** `reasoning_options` lists adjustable controls, for example:
+
+```json
+{
+  "reasoning_options": [
+    { "type": "effort", "values": ["low", "medium", "high", "xhigh", "max"] },
+    { "type": "toggle" }
+  ]
+}
+```
+
+`effort.values` is a complete list: known effort levels absent from it are hidden. `none` maps to Pi's `off` on OpenAI effort APIs. A `toggle` or `budget_tokens` control keeps `off` available; an effort-only model without `none` hides it. Malformed controls and unknown effort values are ignored. Budget options retain validated `min`/`max` limits in metadata; manual thinking uses Pi's existing budget levels and budget calculation.
+
+On `anthropic-messages`, an effort option selects adaptive thinking when there is no budget option, or when the list includes `max` or `xhigh` (which require adaptive thinking). An effort-plus-budget model with only `low`/`medium`/`high`, such as Opus 4.5, stays in manual budget mode. Explicit provider `compat.forceAdaptiveThinking: true` or `false` overrides this inference. In adaptive mode, Pi's `minimal` is an alias for native `low`. `toggle` does not describe per-effort restrictions or Sonnet's `between_tools` mode; those still require explicit configuration or gateway verification.
+
+Endpoint controls take precedence; matching catalog controls fill missing `reasoning_options`. Catalog `thinkingLevelMap` and `capabilities.effort` do not replace endpoint declarations.
 
 **Effort capabilities.** `capabilities.effort` lists backend effort values as booleans or `{ "supported": boolean }` objects, as in Anthropic's model list:
 
@@ -233,23 +250,24 @@ It is used only where Pi actually sends that effort value:
 
 | `api` | Condition | Pi level → backend effort |
 | --- | --- | --- |
-| `anthropic-messages` | Provider `compat.forceAdaptiveThinking: true` (`output_config.effort`) | `minimal` and `low` → `low`; other levels keep their names |
+| `anthropic-messages` | Inferred from `reasoning_options`, or provider `compat.forceAdaptiveThinking: true` (`output_config.effort`) | `minimal` and `low` → `low`; other levels keep their names |
 | `openai-responses` | Always (`reasoning.effort`) | Same name |
 | `openai-completions` | `compat.thinkingFormat` absent or `"openai"`, and `compat.supportsReasoningEffort` is not `false` (`reasoning_effort`) | Same name |
 
-If a level's backend value is explicitly supported, the level uses that value. If it is explicitly unsupported, the level is `null`. If it is not listed, the default applies: standard levels stay available and `xhigh` / `max` stay hidden. A level is never remapped to a different backend value. `effort.supported: false`, malformed entries, other APIs, and Anthropic budget thinking (without `forceAdaptiveThinking`, where Pi sends no effort) keep the defaults. With the example above, an adaptive Anthropic model offers only `off` and `medium`. The OpenAI rows assume Pi sends `reasoning_effort`; Pi's URL detection turns it off for some hosts (for example xAI or Z.ai), so set `compat` explicitly there.
+If a level's backend value is explicitly supported, the level uses that value. If it is explicitly unsupported, the level is `null`. If it is not listed, the default applies: standard levels stay available and `xhigh` / `max` stay hidden. A level is never remapped to a different backend value. `effort.supported: false` disables catalog effort controls. Malformed entries, other APIs, and Anthropic budget thinking (without adaptive mode, where Pi sends no effort) keep the defaults. With the example above, an adaptive Anthropic model offers only `off` and `medium`. The OpenAI rows assume Pi sends `reasoning_effort`; Pi's URL detection turns it off for some hosts (for example xAI or Z.ai), so set `compat` explicitly there.
 
 Each key is resolved separately, from lowest to highest precedence:
 
 1. Defaults: `xhigh` and `max` are `null`.
-2. Levels derived from `capabilities.effort`.
-3. The model's explicit map.
-4. Provider `compat.thinkingLevelMap`, including explicit `null`.
-5. `modelOverrides[modelId].thinkingLevelMap` in models.json, applied by Pi.
+2. Endpoint `reasoning_options`, or matching catalog controls when absent.
+3. Levels derived from endpoint `capabilities.effort`.
+4. The endpoint model's explicit map.
+5. Provider `compat.thinkingLevelMap`, including explicit `null`.
+6. `modelOverrides[modelId].thinkingLevelMap` in models.json, applied by Pi.
 
 Provider `compat.reasoning: false` still limits every model to `off`.
 
-The cache stores advertised thinking metadata per model and revalidates it at startup. The final map is rebuilt from that metadata and the current provider configuration, so cached startup, offline reads, and online refresh agree. Caches written by older versions have no advertised metadata and keep the defaults, even if they stored extra tiers, until the next online refresh. The metadata is the endpoint's claim; confirm a tier with a real request before relying on it.
+The cache stores advertised thinking metadata per model and revalidates it at startup. The final map is rebuilt from that metadata and the current provider configuration, so cached startup, offline reads, and online refresh agree. Caches written by older versions have no advertised metadata and keep the defaults, even if they stored extra tiers, until the next online refresh. Reasoning controls from older metadata caches become available after the next successful catalog refresh. The metadata is the endpoint's or catalog provider's claim; confirm a tier with a real request before relying on it.
 
 ## Uninstall
 

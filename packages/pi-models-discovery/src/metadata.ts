@@ -7,12 +7,19 @@ export type EffortLevel = typeof EFFORT_LEVELS[number];
 const THINKING_LEVELS = ["off", ...EFFORT_LEVELS] as const;
 export type ThinkingLevelMap = NonNullable<ProviderModelConfig["thinkingLevelMap"]>;
 
+export type ReasoningOption =
+	| { type: "effort"; values: string[] }
+	| { type: "budget_tokens"; min?: number; max?: number }
+	| { type: "toggle" };
+
 /** 模型列表声明的思考档位；缓存保存声明本身，注册时再结合 api 与 provider compat 推导映射。 */
 export interface AdvertisedThinking {
 	/** 模型条目显式给出的 Pi 档位映射。 */
 	thinkingLevelMap?: ThinkingLevelMap;
 	/** capabilities.effort 中逐个后端 effort 值的支持情况；未声明的值不出现。 */
-	effort?: Partial<Record<EffortLevel, boolean>>;
+	effort?: Partial<Record<EffortLevel, boolean>> | false;
+	/** models.dev reasoning_options; effort values form a complete list, unlike sparse effort capabilities. */
+	reasoningOptions?: ReasoningOption[];
 }
 
 /** 模型列表条目按别名归一后的元数据；缺失字段由 buildModel 补默认值。 */
@@ -49,7 +56,7 @@ function validThinkingLevelMap(value: unknown): ThinkingLevelMap | undefined {
 
 /** effort 整体声明不支持时不推导任何档位；逐值只接受布尔或 { supported: 布尔 }。 */
 function effortSupport(value: unknown): AdvertisedThinking["effort"] {
-	if (capabilitySupported(value) === false) return undefined;
+	if (capabilitySupported(value) === false) return false;
 	const raw = asRecord(value);
 	const support: AdvertisedThinking["effort"] = {};
 	for (const level of EFFORT_LEVELS) {
@@ -60,10 +67,37 @@ function effortSupport(value: unknown): AdvertisedThinking["effort"] {
 }
 
 /** 显式映射取第一个含有效项的别名；模型列表与缓存共用同一套校验。 */
-export function advertisedThinking(maps: unknown[], effort: unknown): AdvertisedThinking | undefined {
+export function advertisedThinking(maps: unknown[], effort: unknown, options?: unknown): AdvertisedThinking | undefined {
 	const thinkingLevelMap = maps.map(validThinkingLevelMap).find((map) => map !== undefined);
 	const effortLevels = effortSupport(effort);
-	return thinkingLevelMap || effortLevels ? { thinkingLevelMap, effort: effortLevels } : undefined;
+	const reasoningOptions = parseReasoningOptions(options);
+	return thinkingLevelMap || effortLevels !== undefined || reasoningOptions
+		? { thinkingLevelMap, effort: effortLevels, ...(reasoningOptions ? { reasoningOptions } : {}) }
+		: undefined;
+}
+
+/** Keep supported control types and finite budget limits; malformed options never erase defaults. */
+function parseReasoningOptions(value: unknown): ReasoningOption[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const options: ReasoningOption[] = [];
+	for (const entry of value) {
+		const option = asRecord(entry);
+		if (option.type === "effort" && Array.isArray(option.values)) {
+			const values = [...new Set(option.values.filter((v): v is string =>
+				typeof v === "string" && ([...EFFORT_LEVELS, "none", "default"] as readonly string[]).includes(v)))];
+			if (values.length && !options.some((v) => v.type === "effort")) options.push({ type: "effort", values });
+		} else if (option.type === "toggle") {
+			if (!options.some((v) => v.type === "toggle")) options.push({ type: "toggle" });
+		} else if (option.type === "budget_tokens") {
+			const min = positiveTokenLimit(option.min);
+			const max = positiveTokenLimit(option.max);
+			if (min !== undefined && max !== undefined && max < min) continue;
+			if (!options.some((v) => v.type === "budget_tokens")) options.push({
+				type: "budget_tokens", ...(min !== undefined ? { min } : {}), ...(max !== undefined ? { max } : {}),
+			});
+		}
+	}
+	return options.length ? options : undefined;
 }
 
 function positiveTokenLimit(...values: unknown[]): number | undefined {
@@ -96,6 +130,7 @@ export function canonicalizeModel(value: unknown): ModelMetadata | undefined {
 	const pricing = asRecord(raw.pricing);
 	const limit = asRecord(raw.limit);
 	const modalities = asRecord(raw.modalities);
+	const savedThinking = asRecord(raw.thinking);
 	return {
 		id: raw.id,
 		api: raw.api === "openai-responses" || raw.api === "openai-completions" || raw.api === "anthropic-messages" || raw.api === "google-generative-ai"
@@ -107,7 +142,11 @@ export function canonicalizeModel(value: unknown): ModelMetadata | undefined {
 		reasoning: capabilitySupported(raw.reasoning)
 			?? capabilitySupported(capabilities.reasoning)
 			?? capabilitySupported(capabilities.thinking),
-		thinking: advertisedThinking([raw.thinkingLevelMap, raw.thinking_level_map], capabilities.effort),
+		thinking: advertisedThinking(
+			[raw.thinkingLevelMap, raw.thinking_level_map, savedThinking.thinkingLevelMap],
+			capabilities.effort ?? savedThinking.effort,
+			raw.reasoning_options ?? savedThinking.reasoningOptions,
+		),
 		cost: {
 			input: nonNegativeCost(cost.input, pricing.input_per_million),
 			output: nonNegativeCost(cost.output, pricing.output_per_million),
@@ -161,27 +200,42 @@ export function parseMetadataCatalog(payload: unknown): MetadataCatalog | undefi
 	return catalog.models.size > 0 || catalog.providers.size > 0 ? catalog : undefined;
 }
 
-/** Never guess aliases or choose arbitrarily between catalogs with the same ID. */
+/** Normalize only Claude spelling inside the Anthropic namespace; preserve versions and date suffixes. */
+function findProviderMetadata(models: Map<string, ModelMetadata> | undefined, id: string, provider: string): ModelMetadata | undefined {
+	const exact = models?.get(id);
+	if (exact || !models || provider !== "anthropic") return exact;
+	const normalize = (value: string) => /^claude-(opus|sonnet|haiku|fable|mythos)-\d+(?:[.-]\d+)*$/i.test(value)
+		? value.toLowerCase().replace(/\./g, "-") : undefined;
+	const key = normalize(id);
+	if (!key) return undefined;
+	const matches = [...models].filter(([candidate]) => normalize(candidate) === key);
+	return matches.length === 1 ? matches[0][1] : undefined;
+}
+
+/** Exact matches win; Claude spelling normalization stays within the selected Anthropic provider. */
 export function findMetadata(catalog: MetadataCatalog, id: string, providerId: string, metadataProvider?: string): ModelMetadata | undefined {
 	if (catalog.models.size > 0) return catalog.models.get(id);
 	if (metadataProvider) {
 		const models = catalog.providers.get(metadataProvider);
-		return models?.get(id) ?? (id.startsWith(`${metadataProvider}/`) ? models?.get(id.slice(metadataProvider.length + 1)) : undefined);
+		const exact = models?.get(id);
+		if (exact) return exact;
+		return findProviderMetadata(models, id.startsWith(`${metadataProvider}/`) ? id.slice(metadataProvider.length + 1) : id, metadataProvider);
 	}
-	const local = catalog.providers.get(providerId)?.get(id);
+	const local = findProviderMetadata(catalog.providers.get(providerId), id, providerId);
 	if (local) return local;
 	const slash = id.indexOf("/");
 	if (slash > 0) {
-		const qualified = catalog.providers.get(id.slice(0, slash))?.get(id.slice(slash + 1));
+		const qualified = findProviderMetadata(catalog.providers.get(id.slice(0, slash)), id.slice(slash + 1), id.slice(0, slash));
 		if (qualified) return qualified;
 	}
 	const matches = [...catalog.providers.values()].map((models) => models.get(id)).filter((model) => model !== undefined);
 	return matches.length === 1 ? matches[0] : undefined;
 }
 
-/** Endpoint declarations win, including false and zero; keep the endpoint's ID and thinking tiers. */
+/** Endpoint declarations win, including false and zero; catalog reasoning controls fill missing controls. */
 export function mergeMetadata(endpoint: ModelMetadata, fallback?: ModelMetadata): ModelMetadata {
 	if (!fallback) return endpoint;
+	const reasoningOptions = endpoint.thinking?.reasoningOptions ?? fallback.thinking?.reasoningOptions;
 	return {
 		id: endpoint.id,
 		api: endpoint.api,
@@ -190,7 +244,9 @@ export function mergeMetadata(endpoint: ModelMetadata, fallback?: ModelMetadata)
 		maxTokens: endpoint.maxTokens ?? fallback.maxTokens,
 		input: endpoint.input ?? fallback.input,
 		reasoning: endpoint.reasoning ?? fallback.reasoning,
-		thinking: endpoint.thinking,
+		thinking: endpoint.thinking || reasoningOptions ? {
+			...endpoint.thinking, ...(reasoningOptions ? { reasoningOptions } : {}),
+		} : undefined,
 		cost: {
 			input: endpoint.cost?.input ?? fallback.cost?.input,
 			output: endpoint.cost?.output ?? fallback.cost?.output,

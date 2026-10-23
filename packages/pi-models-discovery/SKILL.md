@@ -16,7 +16,7 @@ description: "配置与排查 models.json 的动态模型发现、缓存刷新�
 
 只处理带 `discoverModels: true` 的 provider。确认 `baseUrl`、`api`、可选 `modelsUrl` / `apiKey`、headers/compat 以及服务的模型列表响应。发现请求使用 `GET modelsUrl`（完整 URL，不追加 `/models`）；未配置或为空时使用 `GET {baseUrl}/models`。`modelsUrl` 仅影响发现和刷新，不改变聊天请求的 `baseUrl`；它会接收现有鉴权信息，须使用可信端点。
 
-元数据查询是可选的：设置 `metadataUrl: "https://models.dev/api.json"` 或独立模型目录 API，必要时用 `metadataProvider` 指定精确目录 provider。目录请求不携带端点凭证。端点列表决定可用性，只补齐端点模型的缺失字段，不注册目录独有模型、不发聊天探测请求。歧义 ID 须指定元数据 provider，不能猜测别名。目录价格可能与网关不同；实际费率用端点元数据或 `modelOverrides`。目录 JSON 自动更新，查询失败警告并尝试该 URL 的上次成功数据；启动默认刷新，`refreshOnStartup: false` 可关闭缓存命中时的启动联网；修改元数据来源立即使模型缓存失效。
+元数据查询是可选的：设置 `metadataUrl: "https://models.dev/api.json"` 或独立模型目录 API，必要时用 `metadataProvider` 指定精确目录 provider。目录请求不携带端点凭证。端点列表决定可用性，只补齐端点模型的缺失字段，不注册目录独有模型、不发聊天探测请求。歧义 ID 须指定元数据 provider。在选定的 `anthropic` 命名空间内，Claude ID 支持大小写和数字版本中点号/连字符归一匹配，如 `Claude-Sonnet-4.6` → `claude-sonnet-4-6`；保留版本与日期后缀，归一后歧义不匹配。其他 provider 和扁平目录只精确匹配。目录价格可能与网关不同；实际费率用端点元数据或 `modelOverrides`。目录 JSON 自动更新，查询失败警告并尝试该 URL 的上次成功数据；启动默认刷新，`refreshOnStartup: false` 可关闭缓存命中时的启动联网；修改元数据来源立即使模型缓存失效。
 
 ## 修改
 
@@ -32,7 +32,7 @@ description: "配置与排查 models.json 的动态模型发现、缓存刷新�
 
 发现的模型默认隐藏 `xhigh` / `max`（映射为 `null`），标准档位沿用 Pi 默认映射。provider 的 `compat.thinkingLevelMap` 可显式开启支持的档位或将不支持的档位置 `null`；非推理服务用 `compat.reasoning: false` 关闭推理，必要时配合 `compat.supportsReasoningEffort: false`。这两个扩展配置字段会提取到模型顶层，其余 compat 正常转发。逐模型差异用 `modelOverrides` 按 model.id 覆盖。旧缓存启动时会应用当前 compat 配置，无需联网刷新。
 
-模型列表若返回 `thinkingLevelMap` / `thinking_level_map` 或 `capabilities.effort`，会逐模型开启或隐藏档位（解读条件与优先级见 README「思考档位」）。Anthropic 的 effort 声明只在 provider 设置 `compat.forceAdaptiveThinking: true` 时生效。provider 的 `compat.thinkingLevelMap` 逐项覆盖声明，`modelOverrides` 优先级最高。不要仅凭 `/thinking` 能选到某档位就认定后端支持，应以真实请求确认。
+模型列表若返回 `thinkingLevelMap` / `thinking_level_map` 或 `capabilities.effort`，会逐模型开启或隐藏档位（解读条件与优先级见 README「思考档位」）。端点或匹配 models.dev 目录的 `reasoning_options` 会保存 effort 完整列表、toggle 和预算限制；未列出的 effort 隐藏。Anthropic 有 effort 且无预算，或支持 `max`/`xhigh` 时自动启用自适应思考；Opus 4.5 等 low/medium/high 加预算模型保持手动预算。provider 的 `compat.forceAdaptiveThinking` 显式值优先。仅 effort 且无 toggle/预算/none 的模型隐藏 off，自适应 minimal 映射为 low。provider 的 `compat.thinkingLevelMap` 逐项覆盖声明，`modelOverrides` 优先级最高。不要仅凭 `/thinking` 能选到某档位就认定后端支持，应以真实请求确认。
 
 ## 模型元数据
 

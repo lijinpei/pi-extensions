@@ -36,7 +36,7 @@
  * - 注册 refreshModels：打开 /model 触发在线刷新时重新发现；
  *   离线初始化（allowNetwork=false）返回上次成功列表（含缓存），尚无成功记录时抛错，
  *   以免空列表清掉 models.json 手写 models。
- * - 发现模型默认隐藏 xhigh/max；模型列表声明的 thinkingLevelMap 或 capabilities.effort 可逐模型开启或隐藏档位，
+ * - 发现模型默认隐藏 xhigh/max；端点 thinkingLevelMap / capabilities.effort 与端点或目录的 reasoning_options 可逐模型开启或隐藏档位，
  *   provider.compat.thinkingLevelMap 逐项覆盖声明，provider.compat.reasoning 可关闭推理；
  *   逐模型差异用 provider.modelOverrides 覆盖（优先级最高）。
  * - 发现请求的 apiKey 解析仅支持字面量与 $ENV_VAR/${ENV_VAR} 插值；
@@ -56,7 +56,7 @@ import { NOTICE_TAG_COLOR, createTranslator, installNoticeRenderer, loadCatalog,
 import { openDiscoveryPanel, type PanelProvider } from "./config-panel.ts";
 import {
 	EFFORT_LEVELS, advertisedThinking, asRecord, endpointModel, findMetadata, mergeMetadata, parseMetadataCatalog,
-	type AdvertisedThinking, type EffortLevel, type MetadataCatalog, type ModelMetadata, type ThinkingLevelMap,
+	type AdvertisedThinking, type EffortLevel, type MetadataCatalog, type ModelMetadata, type ReasoningOption, type ThinkingLevelMap,
 } from "./metadata.ts";
 import { readSavedMetadata, saveMetadata } from "./metadata-store.ts";
 import { updateJsonFile } from "./storage.ts";
@@ -350,23 +350,51 @@ function effortThinkingLevelMap(effort: AdvertisedThinking["effort"], toBackend:
 	return map;
 }
 
+/** models.dev effort lists are exhaustive; budget-only models keep Pi's standard budget levels. */
+function reasoningOptionThinking(options: ReasoningOption[] | undefined, api: string | undefined, compat: Record<string, unknown>) {
+	const effort = options?.find((option) => option.type === "effort");
+	const values = effort?.values.some((value) => value !== "default") ? effort.values : undefined;
+	const budget = options?.some((option) => option.type === "budget_tokens");
+	const inferredAdaptive = api === "anthropic-messages" && values &&
+		(!budget || values.includes("max") || values.includes("xhigh"));
+	const resolvedCompat = {
+		...(inferredAdaptive ? { forceAdaptiveThinking: true } : {}),
+		...compat,
+	};
+	const toBackend = backendEffort(api, resolvedCompat);
+	const map: ThinkingLevelMap = {};
+	if (values && toBackend) {
+		for (const level of EFFORT_LEVELS) {
+			const value = toBackend(level);
+			map[level] = values.includes(value) ? value : null;
+		}
+		if (api !== "anthropic-messages" && values.includes("none")) map.off = "none";
+		else if (!budget && !options?.some((option) => option.type === "toggle")) map.off = null;
+	}
+	return { map, compat: resolvedCompat };
+}
+
 /**
  * 扩展专用的推理默认值从 compat 提取，不作为请求兼容字段转发。
- * 档位映射逐项叠加：xhigh/max 默认隐藏 < effort 推导 < 模型显式映射 < provider compat.thinkingLevelMap；
+ * 档位映射逐项叠加：默认值 < reasoning_options < effort 推导 < 模型显式映射 < provider compat.thinkingLevelMap；
  * Pi 之后再叠加 models.json 的 modelOverrides。
  */
 function modelThinking(provider: ThinkingProvider | undefined, discoveredReasoning?: boolean, advertised?: AdvertisedThinking) {
 	const { reasoning, thinkingLevelMap, ...compat } = provider?.compat ?? {};
+	const options = advertised?.effort === false
+		? advertised.reasoningOptions?.filter((option) => option.type !== "effort") : advertised?.reasoningOptions;
+	const controls = reasoningOptionThinking(options, provider?.api, compat);
 	return {
 		reasoning: typeof reasoning === "boolean" ? reasoning : (discoveredReasoning ?? true),
 		thinkingLevelMap: {
 			xhigh: null,
 			max: null,
-			...effortThinkingLevelMap(advertised?.effort, backendEffort(provider?.api, compat)),
+			...controls.map,
+			...effortThinkingLevelMap(advertised?.effort, backendEffort(provider?.api, controls.compat)),
 			...advertised?.thinkingLevelMap,
 			...(asRecord(thinkingLevelMap) as ThinkingLevelMap),
 		},
-		compat: { supportsDeveloperRole: false, ...compat },
+		compat: { supportsDeveloperRole: false, ...controls.compat },
 	};
 }
 
@@ -627,7 +655,7 @@ function registerFromCache(
 			...modelThinking(
 				{ ...entry, api: model.api ?? entry.api },
 				typeof model?.reasoning === "boolean" ? model.reasoning : undefined,
-				advertisedThinking([thinking.thinkingLevelMap], thinking.effort),
+				advertisedThinking([thinking.thinkingLevelMap], thinking.effort, thinking.reasoningOptions),
 			),
 		};
 	});

@@ -114,9 +114,9 @@ pi install npm:pi-models-discovery
 | `metadataUrl` | 完整的 HTTP(S) 目录 URL。留空或省略关闭查询，保持仅从端点发现。接受 models.dev 的 provider/model 映射、模型数组或模型列表 API 的 `{ "data": [...] }`。请求超时为 5 秒。 |
 | `metadataProvider` | models.dev 目录中精确的 provider ID，如 `anthropic` 或 `openai`。指定后只在该 provider 中查找；对扁平模型列表无影响。 |
 
-未指定 `metadataProvider` 时，依次尝试当前配置 provider 中的精确模型 ID、带 provider 前缀的模型 ID（`anthropic/claude-sonnet-4-6`）、仅出现在一个目录 provider 中的精确模型 ID。遇到歧义沿用端点元数据和默认值，可指定 `metadataProvider` 消除歧义。匹配区分大小写，不猜测别名、版本后缀或 `latest`。聊天请求始终使用端点返回的模型 ID。
+未指定 `metadataProvider` 时，依次尝试当前配置 provider 中的精确模型 ID、带 provider 前缀的模型 ID（`anthropic/claude-sonnet-4-6`）、仅出现在一个目录 provider 中的精确模型 ID。遇到歧义沿用端点元数据和默认值，可指定 `metadataProvider` 消除歧义。精确 ID 优先。在选定的 `anthropic` 命名空间内（`metadataProvider: "anthropic"`、provider ID 为 `anthropic`，或带 `anthropic/` 前缀的 ID），Claude 系列 ID 还会匹配大小写差异和数字版本中的点号/连字符差异：`Claude-Sonnet-4.6` 可匹配 `claude-sonnet-4-6`。版本和日期后缀完整保留，归一后有歧义时不匹配；其他 provider 和扁平目录仍精确匹配。聊天请求始终使用端点返回的模型 ID。
 
-**优先级：** Pi 的 `modelOverrides` 和现有 provider 思考配置仍照常生效。元数据字段依次优先使用有效端点值、目录值、默认值；显式 `false` 和零价格不会被覆盖，价格逐字段合并。目录价格属于所选目录 provider，网关收费可能不同，请用端点价格或 `modelOverrides` 指定实际费率。额外思考档位只由端点声明或显式覆盖开启，目录能力不能证明网关支持这些档位。
+**优先级：** Pi 的 `modelOverrides` 和现有 provider 思考配置仍照常生效。元数据字段依次优先使用有效端点值、目录值、默认值；显式 `false` 和零价格不会被覆盖，价格逐字段合并。目录价格属于所选目录 provider，网关收费可能不同，请用端点价格或 `modelOverrides` 指定实际费率。端点 `reasoning_options` 优先，缺失的控制项可由 models.dev 补齐并开启额外思考档位；端点 effort 能力、显式映射和用户覆盖仍优先。目录描述所选 provider 的控制项，依赖这些档位前须测试真实网关请求。
 
 目录请求不会携带 provider 的 API key 或 headers；独立目录 API 须允许无鉴权读取。查询失败会显示警告，并在存在时使用已保存目录；端点发现仍可使用。端点请求失败或返回空列表时，目录条目不能证明可用性，保留匹配配置的模型缓存或手写模型回退。此处可用性指端点列出了模型，发现流程不会发送计费的聊天探测请求。
 
@@ -218,9 +218,26 @@ token 上限必须为正的安全整数；无效值会回退到下一个别名�
 
 ### 思考档位
 
-模型条目可用两种方式声明思考档位。
+模型条目可用三种方式声明思考控制项。插件会在元数据缓存和模型缓存中保存声明，并在启动时重建最终映射。
 
 **显式映射**：依次读取 `thinkingLevelMap`、`thinking_level_map`，格式与 Pi 相同。使用第一个含有效项的别名，整体生效，不跨别名合并。键只能是 `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`；值须为非空字符串（发给后端的值）或 `null`（隐藏该档位），其余项忽略。
+
+**models.dev 控制项。** `reasoning_options` 列出可调整的控制项，例如：
+
+```json
+{
+  "reasoning_options": [
+    { "type": "effort", "values": ["low", "medium", "high", "xhigh", "max"] },
+    { "type": "toggle" }
+  ]
+}
+```
+
+`effort.values` 是完整列表，未列出的已知 effort 档位会隐藏。OpenAI effort API 的 `none` 映射为 Pi 的 `off`；`toggle` 或 `budget_tokens` 控制项保留 `off`，不含 `none` 的仅 effort 模型隐藏 `off`。格式错误的控制项和未知 effort 值会忽略。预算控制项会保存校验后的 `min`/`max`，手动思考继续使用 Pi 现有的预算档位和预算计算。
+
+对 `anthropic-messages`，有 effort 但无预算控制项，或 effort 列表含 `max`/`xhigh`（需自适应思考）时，自动选择自适应思考；只有 `low`/`medium`/`high` 加预算控制项的模型（如 Opus 4.5）仍使用手动预算。provider 显式设置 `compat.forceAdaptiveThinking: true` 或 `false` 优先于推导。自适应模式下 Pi 的 `minimal` 是原生 `low` 的别名。`toggle` 不描述每个 effort 的限制或 Sonnet 的 `between_tools` 模式，这些仍须显式配置或网关验证。
+
+端点控制项优先，匹配目录只补齐缺失的 `reasoning_options`；目录的 `thinkingLevelMap` 和 `capabilities.effort` 不替代端点声明。
 
 **effort 能力**：`capabilities.effort` 用布尔值或 `{ "supported": 布尔 }` 列出后端 effort 值，与 Anthropic 模型列表的格式一致：
 
@@ -233,23 +250,24 @@ token 上限必须为正的安全整数；无效值会回退到下一个别名�
 
 | `api` | 条件 | Pi 档位 → 后端 effort |
 | --- | --- | --- |
-| `anthropic-messages` | provider 的 `compat.forceAdaptiveThinking: true`（`output_config.effort`） | `minimal` 与 `low` → `low`；其余同名 |
+| `anthropic-messages` | 由 `reasoning_options` 推导，或 provider 的 `compat.forceAdaptiveThinking: true`（`output_config.effort`） | `minimal` 与 `low` → `low`；其余同名 |
 | `openai-responses` | 始终（`reasoning.effort`） | 同名 |
 | `openai-completions` | 未设置 `compat.thinkingFormat` 或为 `"openai"`，且 `compat.supportsReasoningEffort` 不为 `false`（`reasoning_effort`） | 同名 |
 
-档位对应的后端值显式支持时，该档位映射到这个值；显式不支持时置为 `null`；未列出时沿用默认值：标准档位保留，`xhigh` / `max` 仍隐藏。档位不会改映射到其他后端值。`effort.supported: false`、格式错误的项、其他 API，以及 Anthropic 预算式思考（未设 `forceAdaptiveThinking` 时 Pi 不发送 effort）都沿用默认值。按上例，自适应思考的 Anthropic 模型只提供 `off` 和 `medium`。OpenAI 两行假定 Pi 会发送 `reasoning_effort`；Pi 会按 URL 对部分服务（如 xAI、Z.ai）关闭它，这类服务请显式设置 `compat`。
+档位对应的后端值显式支持时，该档位映射到这个值；显式不支持时置为 `null`；未列出时沿用默认值：标准档位保留，`xhigh` / `max` 仍隐藏。档位不会改映射到其他后端值。`effort.supported: false` 会关闭目录的 effort 控制项。格式错误的项、其他 API，以及 Anthropic 预算式思考（非自适应模式时 Pi 不发送 effort）都沿用默认值。按上例，自适应思考的 Anthropic 模型只提供 `off` 和 `medium`。OpenAI 两行假定 Pi 会发送 `reasoning_effort`；Pi 会按 URL 对部分服务（如 xAI、Z.ai）关闭它，这类服务请显式设置 `compat`。
 
 每个档位单独解析，优先级从低到高：
 
 1. 默认值：`xhigh` 和 `max` 为 `null`。
-2. 由 `capabilities.effort` 推导的档位。
-3. 模型的显式映射。
-4. provider 的 `compat.thinkingLevelMap`，包括显式 `null`。
-5. models.json 中 `modelOverrides[modelId].thinkingLevelMap`，由 Pi 叠加。
+2. 端点 `reasoning_options`，缺失时用匹配目录的控制项。
+3. 由端点 `capabilities.effort` 推导的档位。
+4. 端点模型的显式映射。
+5. provider 的 `compat.thinkingLevelMap`，包括显式 `null`。
+6. models.json 中 `modelOverrides[modelId].thinkingLevelMap`，由 Pi 叠加。
 
 provider 的 `compat.reasoning: false` 仍会让所有模型只提供 `off`。
 
-缓存按模型保存服务声明的思考元数据，启动时重新校验，再结合当前 provider 配置重建最终映射，因此缓存启动、离线读取与在线刷新结果一致。旧版本写入的缓存没有声明元数据，即使其中存过额外档位，也沿用默认值，直到下一次在线刷新。元数据只是服务端的声明；依赖某个档位前，请用真实请求确认。
+缓存按模型保存服务声明的思考元数据，启动时重新校验，再结合当前 provider 配置重建最终映射，因此缓存启动、离线读取与在线刷新结果一致。旧版本写入的缓存没有声明元数据，即使其中存过额外档位，也沿用默认值，直到下一次在线刷新。旧元数据缓存中的推理控制项会在下一次成功刷新目录后补齐。元数据只是服务端或目录 provider 的声明；依赖某个档位前，请用真实请求确认。
 
 ## 卸载
 

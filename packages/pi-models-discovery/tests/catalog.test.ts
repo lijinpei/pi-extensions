@@ -480,7 +480,7 @@ const requestStreams: Record<string, (model: Model<Api>, context: never, options
 };
 
 /** 经 Pi 真实的请求转换生成请求体（假 fetch，不联网），返回实际发送的 effort 字段。 */
-async function requestedEffort(model: Model<Api>, reasoning: ThinkingLevel): Promise<unknown> {
+async function requestedPayload(model: Model<Api>, reasoning: ThinkingLevel): Promise<Record<string, any>> {
 	let payload: Record<string, any> = {};
 	const events = requestStreams[model.api](model, { messages: [{ role: "user", content: "hi", timestamp: 0 }] } as never, {
 		apiKey: "test-key",
@@ -493,6 +493,11 @@ async function requestedEffort(model: Model<Api>, reasoning: ThinkingLevel): Pro
 		fetch: async () => new Response("{}", { status: 400 }),
 	});
 	for await (const _event of events) { /* 请求被假 fetch 拒绝即结束 */ }
+	return payload;
+}
+
+async function requestedEffort(model: Model<Api>, reasoning: ThinkingLevel): Promise<unknown> {
+	const payload = await requestedPayload(model, reasoning);
 	if (model.api === "anthropic-messages") return payload.output_config?.effort;
 	if (model.api === "openai-responses") return payload.reasoning?.effort;
 	return payload.reasoning_effort;
@@ -1045,4 +1050,137 @@ test("an invalid model ID regex warns and preserves static fallback without fetc
 	await assert.rejects(() => h.registrations.get("route")!.refreshModels!(refreshContext(false)));
 	await assert.rejects(() => h.registrations.get("route")!.refreshModels!(refreshContext(true)), /modelIdRegex/);
 	assert.equal(h.requests.length, 2);
+});
+
+test("models.dev controls enrich Claude gateway aliases and reach Pi's actual adaptive or budget request payload", async (t) => {
+	const entries = [
+		{ id: "Claude-Opus-5" }, { id: "Claude-Sonnet-4.6" }, { id: "Claude-Opus-4.5" },
+		{ id: "Claude-Sonnet-4.5" }, { id: "Claude-Sonnet-5" }, { id: "custom" },
+		{ id: "Claude-Opus-4.8", capabilities: { effort: { high: false } } },
+	];
+	const h = await discoveryHarness(t, entries);
+	const all = ["low", "medium", "high", "xhigh", "max"];
+	const effort = (values = all) => ({ type: "effort", values });
+	const catalog = { anthropic: { models: {
+		"claude-opus-5": { reasoning: true, limit: { context: 128_000, output: 8192 }, reasoning_options: [effort()] },
+		"claude-sonnet-4-6": { reasoning: true, reasoning_options: [effort(["low", "medium", "high", "max"]), { type: "budget_tokens", min: 1024 }] },
+		"claude-opus-4-5": { reasoning: true, reasoning_options: [effort(["low", "medium", "high"]), { type: "budget_tokens", min: 1024 }] },
+		"claude-sonnet-4-5": { reasoning: true, reasoning_options: [{ type: "budget_tokens", min: 1024 }] },
+		"claude-sonnet-5": { reasoning: true, reasoning_options: [{ type: "toggle" }, effort()] },
+		"claude-opus-4-8": { reasoning: true, reasoning_options: [effort()] },
+		"claude-haiku-5-5": { reasoning: true, reasoning_options: [effort()] },
+	} } };
+	const requests: Array<{ url: string; headers: RequestInit["headers"] }> = [];
+	t.mock.method(globalThis, "fetch", async (url: string, init: RequestInit) => {
+		requests.push({ url, headers: init.headers });
+		return Response.json(url === metadataUrl ? catalog : { data: entries });
+	});
+	await h.configure({ gateway: { ...discoveryProvider, api: "anthropic-messages", metadataUrl, metadataProvider: "anthropic", apiKey: "test-key" } });
+	await h.start();
+	const config = h.registrations.get("gateway")!;
+	assert.deepEqual(config.models!.map((m) => m.id), entries.map((m) => m.id), "preserve gateway IDs and never register catalog-only models");
+	assert.equal(config.models![0].contextWindow, 128_000);
+	assert.equal(requests.find((r) => r.url === metadataUrl)!.headers, undefined);
+	assert.deepEqual(thinkingLevels(config.models!), [
+		["minimal", "low", "medium", "high", "xhigh", "max"],
+		["off", "minimal", "low", "medium", "high", "max"],
+		["off", "minimal", "low", "medium", "high"],
+		["off", "minimal", "low", "medium", "high"],
+		["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+		["off", "minimal", "low", "medium", "high"],
+		["minimal", "low", "medium", "xhigh", "max"],
+	]);
+	const registry = await piRegistry(h);
+	assert.deepEqual(await offeredEfforts(registry.find("gateway", "Claude-Opus-5")!), {
+		minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max",
+	});
+	assert.equal((await requestedPayload(registry.find("gateway", "Claude-Sonnet-4.6")!, "max")).thinking.type, "adaptive");
+	assert.equal(await requestedEffort(registry.find("gateway", "Claude-Sonnet-4.6")!, "max"), "max");
+	for (const id of ["Claude-Opus-4.5", "Claude-Sonnet-4.5"]) {
+		const payload = await requestedPayload(registry.find("gateway", id)!, "high");
+		assert.equal(payload.thinking.type, "enabled");
+		assert.ok(payload.thinking.budget_tokens >= 1024);
+		assert.equal(payload.output_config, undefined);
+	}
+	const saved = JSON.parse(await readFile(join(h.dir, "extensions", "pi-models-discovery", "metadata.json"), "utf8"));
+	assert.deepEqual(saved.sources[metadataUrl].providers.anthropic.models["claude-opus-5"].thinking.reasoningOptions, [effort()]);
+	await h.start();
+	assert.equal(requests.length, 2, "cached startup must retain controls without networking");
+	assert.deepEqual(h.registrations.get("gateway")!.models, config.models);
+	assert.deepEqual(await h.registrations.get("gateway")!.refreshModels!(refreshContext(false)), config.models);
+	assert.equal(requests.length, 2);
+});
+
+test("complete reasoning effort lists restrict OpenAI levels and endpoint/provider/model overrides remain authoritative", async (t) => {
+	const h = await discoveryHarness(t);
+	t.mock.method(globalThis, "fetch", async (url: string) => Response.json(url === metadataUrl ? { data: [
+		{ id: "complete", reasoning_options: [{ type: "effort", values: ["none", "low", "high", "max"] }] },
+		{ id: "disabled", reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }] },
+		{ id: "endpoint", reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }] },
+	] } : { data: [
+		{ id: "complete", thinkingLevelMap: { high: "medium" } },
+		{ id: "disabled", capabilities: { effort: { supported: false } } },
+		{ id: "endpoint", reasoning_options: [{ type: "effort", values: ["medium"] }] },
+	] }));
+	await h.configure({ gateway: { ...discoveryProvider, api: "openai-responses", metadataUrl,
+		compat: { thinkingLevelMap: { max: null } }, modelOverrides: { complete: { thinkingLevelMap: { xhigh: "high" } } },
+	} });
+	await h.start();
+	const registry = await piRegistry(h);
+	const complete = registry.find("gateway", "complete")!;
+	assert.deepEqual(getSupportedThinkingLevels(complete), ["off", "low", "high", "xhigh"]);
+	assert.equal((await requestedPayload(complete, "off")).reasoning.effort, "none");
+	assert.deepEqual(await offeredEfforts(complete), { low: "low", high: "medium", xhigh: "high" });
+	assert.deepEqual(getSupportedThinkingLevels(registry.find("gateway", "disabled")!), ["off", "minimal", "low", "medium", "high"]);
+	assert.deepEqual(getSupportedThinkingLevels(registry.find("gateway", "endpoint")!), ["medium"]);
+});
+
+test("saved reasoning controls survive catalog failures, revalidate cached options and change on online refresh", async (t) => {
+	const h = await discoveryHarness(t, [{ id: "Claude-Opus-5" }]);
+	let offline = false;
+	let values = ["low", "medium", "high", "xhigh", "max"];
+	t.mock.method(globalThis, "fetch", async (url: string) => {
+		if (url === metadataUrl) {
+			if (offline) throw new Error("catalog offline");
+			return Response.json({ anthropic: { models: { "claude-opus-5": { reasoning_options: [{ type: "effort", values }] } } } });
+		}
+		return Response.json({ data: [{ id: "Claude-Opus-5" }] });
+	});
+	await h.configure({ gateway: { ...discoveryProvider, api: "anthropic-messages", metadataUrl, metadataProvider: "anthropic" } });
+	await h.start();
+	const initial = h.registrations.get("gateway")!.models!;
+	offline = true;
+	assert.deepEqual(await h.registrations.get("gateway")!.refreshModels!(refreshContext(true)), initial, "saved normalized catalogs retain reasoning options");
+	assert.ok(h.warnings().some((message) => message.includes("catalog offline")));
+	offline = false;
+	values = ["low", "high"];
+	assert.deepEqual(thinkingLevels(await h.registrations.get("gateway")!.refreshModels!(refreshContext(true))), [["minimal", "low", "high"]]);
+	await h.start();
+	assert.deepEqual(thinkingLevels(h.registrations.get("gateway")!.models!), [["minimal", "low", "high"]]);
+	const path = join(h.dir, "extensions", "pi-models-discovery", "cache.json");
+	const cache = JSON.parse(await readFile(path, "utf8"));
+	cache.providers.gateway.advertisedThinking["Claude-Opus-5"].reasoningOptions = [{ type: "effort", values: [true, "turbo"] }];
+	await writeFile(path, JSON.stringify(cache));
+	await h.start();
+	assert.deepEqual(thinkingLevels(h.registrations.get("gateway")!.models!), [["off", "minimal", "low", "medium", "high"]], "invalid cached controls must not enable tiers");
+	assert.equal(h.registrations.get("gateway")!.models![0].compat!.forceAdaptiveThinking, undefined);
+});
+
+test("explicit provider thinking mode and reasoning overrides apply over catalog controls", async (t) => {
+	const h = await discoveryHarness(t);
+	t.mock.method(globalThis, "fetch", async (url: string) => Response.json(url === metadataUrl ? { data: [
+		{ id: "model", reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }] },
+	] } : { data: [{ id: "model" }] }));
+	const provider = { ...discoveryProvider, api: "anthropic-messages", metadataUrl, apiKey: "test-key" };
+	await h.configure({
+		budget: { ...provider, compat: { forceAdaptiveThinking: false } },
+		off: { ...provider, compat: { reasoning: false } },
+	});
+	await h.start();
+	const registry = await piRegistry(h);
+	const budget = registry.find("budget", "model")!;
+	assert.equal(budget.compat!.forceAdaptiveThinking, false);
+	assert.deepEqual(getSupportedThinkingLevels(budget), ["off", "minimal", "low", "medium", "high"]);
+	assert.equal((await requestedPayload(budget, "high")).thinking.type, "enabled");
+	assert.deepEqual(getSupportedThinkingLevels(registry.find("off", "model")!), ["off"]);
 });
