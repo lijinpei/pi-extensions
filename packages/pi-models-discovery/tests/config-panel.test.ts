@@ -43,6 +43,7 @@ function customProvider(): PanelProvider {
 		baseUrl: "http://127.0.0.1:9000/pi/v1",
 		modelsUrl: "https://api.example.com/v1/models",
 		modelIdRegex: "^chat-",
+		modelApi: { "^gpt-6": "openai-responses" },
 		metadataUrl: "https://models.dev/api.json",
 		metadataProvider: "anthropic",
 		refreshOnStartup: true,
@@ -82,7 +83,7 @@ test("顶层列出每个 provider，并带「添加 provider」入口", () => {
 });
 
 test("取当前显示值写回，每个可编辑字段都能往返一致", () => {
-	for (const provider of [customProvider(), { ...customProvider(), refreshOnStartup: false, name: "", apiKey: "", modelsUrl: "", modelIdRegex: "", metadataUrl: "", metadataProvider: "" }]) {
+	for (const provider of [customProvider(), { ...customProvider(), refreshOnStartup: false, name: "", apiKey: "", modelsUrl: "", modelIdRegex: "", modelApi: undefined, metadataUrl: "", metadataProvider: "" }]) {
 		for (const item of buildProviderItems(provider)) {
 			if (item.id === PROVIDER_FIELD.rediscover || item.id === PROVIDER_FIELD.remove) continue;
 			const next = applyProviderChange(provider, item.id, item.currentValue);
@@ -93,8 +94,8 @@ test("取当前显示值写回，每个可编辑字段都能往返一致", () =>
 });
 
 test("empty text submenus return their displayed label and round-trip empty configuration values", () => {
-	const provider = { ...customProvider(), name: "", apiKey: "", modelsUrl: "", modelIdRegex: "", metadataUrl: "", metadataProvider: "" };
-	for (const item of buildProviderItems(provider).filter((row) => ["name", "apiKey", "modelsUrl", "modelIdRegex", "metadataUrl", "metadataProvider"].includes(row.id))) {
+	const provider = { ...customProvider(), name: "", apiKey: "", modelsUrl: "", modelIdRegex: "", modelApi: undefined, metadataUrl: "", metadataProvider: "" };
+	for (const item of buildProviderItems(provider).filter((row) => ["name", "apiKey", "modelsUrl", "modelIdRegex", "modelApi", "metadataUrl", "metadataProvider"].includes(row.id))) {
 		let result: string | undefined;
 		const submenu = item.submenu!(item.currentValue, (value) => { result = value; });
 		press(submenu, [ENTER]);
@@ -128,6 +129,21 @@ test("regex panel values preserve significant whitespace and reject malformed pa
 	assert.equal(result, provider.modelIdRegex);
 	assert.deepEqual(applyProviderChange(provider, item.id, result!), provider);
 	assert.throws(() => applyProviderChange(provider, item.id, "["), /modelIdRegex/);
+});
+
+test("modelApi JSON rows round-trip maps, preserve regex whitespace and reject malformed input", () => {
+	const provider = { ...customProvider(), modelApi: { " gpt-6 ": "openai-responses", "^claude-": "anthropic-messages" } };
+	const item = buildProviderItems(provider).find((row) => row.id === "modelApi")!;
+	let result: string | undefined;
+	const submenu = item.submenu!(item.currentValue, (value) => { result = value; });
+	press(submenu, [ENTER]);
+	assert.equal(result, item.currentValue);
+	assert.deepEqual(applyProviderChange(provider, item.id, result!), provider);
+	assert.deepEqual(applyProviderChange(provider, item.id, "{}")!.modelApi, {});
+	assert.equal(applyProviderChange(provider, item.id, "")!.modelApi, undefined);
+	for (const value of ["{", "null", "[]", '{"^gpt-6":[]}', '{"^gpt-6":" "}', '{"[":"openai-responses"}']) {
+		assert.throws(() => applyProviderChange(provider, item.id, value), /modelApi/);
+	}
 });
 
 test("未知字段或没人提供过的候选值不会改配置", () => {

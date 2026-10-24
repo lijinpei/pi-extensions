@@ -150,7 +150,7 @@ test("metadata settings apply immediately and rediscovery reloads catalog and en
 	assert.deepEqual(saved.providers.demo.compat, { supportsDeveloperRole: true });
 
 	contextWindow = 256_000;
-	await runPanel([[ENTER], [...down(10), ENTER]]);
+	await runPanel([[ENTER], [...down(11), ENTER]]);
 	assert.equal(registrations.get("demo")!.models![0].contextWindow, 256_000, "rediscovery must bypass startup request cache");
 	assert.deepEqual(requests.slice(-2), [modelsUrl, metadataUrl]);
 
@@ -219,4 +219,63 @@ test("editing a legacy prefix in the panel migrates it to an escaped regex and c
 	assert.equal(cleared.modelIdRegex, undefined);
 	assert.equal(cleared.modelIdPrefix, undefined);
 	assert.deepEqual(registrations.get("demo")!.models!.map((model) => model.id), ["model.v2", "modelXv2"]);
+});
+
+test("modelApi panel edits apply immediately, reject malformed maps and clear persisted overrides", async (t) => {
+	initTheme("dark");
+	const dir = await mkdtemp(join(tmpdir(), "pi-models-discovery-api-panel-"));
+	const previousDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = dir;
+	t.after(async () => {
+		if (previousDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousDir;
+		await rm(dir, { recursive: true, force: true });
+	});
+	let requests = 0;
+	t.mock.method(globalThis, "fetch", async () => {
+		requests++;
+		return Response.json({ data: [{ id: "known" }, { id: "other" }] });
+	});
+	const modelsPath = join(dir, "models.json");
+	await writeFile(modelsPath, JSON.stringify({ providers: { demo: {
+		baseUrl: "https://api.example.com/v1", api: "openai-completions", discoverModels: true, refreshOnStartup: false,
+		modelApi: { "^known$": "openai-responses" }, headers: { "X-Test": "test" }, compat: { supportsDeveloperRole: true },
+	} } }));
+	const commands = new Map<string, RegisteredCommand>();
+	const registrations = new Map<string, Parameters<ExtensionAPI["registerProvider"]>[1]>();
+	const pi = {
+		registerCommand: (name: string, command: RegisteredCommand) => commands.set(name, command),
+		registerProvider: (id: string, config: Parameters<ExtensionAPI["registerProvider"]>[1]) => registrations.set(id, config),
+		registerEntryRenderer: () => undefined, on: () => undefined,
+	} as unknown as ExtensionAPI;
+	const { default: discovery } = await import("../src/index.ts");
+	await discovery(pi);
+	const notices: string[] = [];
+	const runPanel = async (value?: string) => {
+		const keys = value === undefined ? [ENTER, "\u001B"] : ["\u0001", "\u000B", value, ENTER, "\u001B"];
+		const ui = createScriptedUi([[ENTER], [...down(10), ENTER, ...keys]]);
+		await commands.get("config:model-discovery")!.handler("", { hasUI: true, ui: {
+			custom: ui.custom, notify: (message: string) => notices.push(message),
+		} });
+	};
+	assert.deepEqual(registrations.get("demo")!.models!.map((model) => model.api), ["openai-responses", undefined]);
+	await runPanel();
+	assert.equal(requests, 1, "accepting the displayed map must keep the cache");
+	await runPanel('{"^other$":"openai-responses"}');
+	assert.deepEqual(registrations.get("demo")!.models!.map((model) => model.api), [undefined, "openai-responses"]);
+	const saved = await readFile(modelsPath, "utf8");
+	assert.deepEqual(JSON.parse(saved).providers.demo.modelApi, { "^other$": "openai-responses" });
+	assert.deepEqual(JSON.parse(saved).providers.demo.headers, { "X-Test": "test" });
+	assert.deepEqual(JSON.parse(saved).providers.demo.compat, { supportsDeveloperRole: true });
+	for (const value of ["{", "null", "[]", '{"^other$":[]}', '{"[":"openai-responses"}']) {
+		await runPanel(value);
+		assert.equal(await readFile(modelsPath, "utf8"), saved, "invalid input must not reach disk");
+		assert.equal(requests, 2, "invalid input must not rediscover");
+		assert.deepEqual(registrations.get("demo")!.models!.map((model) => model.api), [undefined, "openai-responses"]);
+	}
+	assert.equal(notices.filter((message) => message.includes("modelApi")).length, 5);
+	await runPanel("");
+	assert.equal(JSON.parse(await readFile(modelsPath, "utf8")).providers.demo.modelApi, undefined);
+	assert.deepEqual(registrations.get("demo")!.models!.map((model) => model.api), [undefined, undefined]);
+	assert.equal(requests, 3);
 });

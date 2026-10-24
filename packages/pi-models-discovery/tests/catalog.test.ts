@@ -1364,3 +1364,62 @@ test("explicit provider thinking mode and reasoning overrides apply over catalog
 	assert.equal((await requestedPayload(budget, "high")).thinking.type, "enabled");
 	assert.deepEqual(getSupportedThinkingLevels(registry.find("off", "model")!), ["off"]);
 });
+
+test("modelApi overrides the provider api per model and invalidates the cache", async (t) => {
+	const h = await discoveryHarness(t, [{ id: "gpt-6.1-sol" }, { id: "gpt-6-sol" }, { id: "Claude-Sonnet-5" }]);
+	await h.configure({ gateway: { ...discoveryProvider, modelApi: { "^gpt-6": "openai-responses" } } });
+	await h.start();
+	assert.deepEqual(
+		h.registrations.get("gateway")!.models!.map((model) => [model.id, model.api]),
+		[["gpt-6.1-sol", "openai-responses"], ["gpt-6-sol", "openai-responses"], ["Claude-Sonnet-5", undefined]],
+	);
+	const registry = await piRegistry(h);
+	assert.equal(registry.find("gateway", "gpt-6.1-sol")!.api, "openai-responses");
+	assert.equal(registry.find("gateway", "Claude-Sonnet-5")!.api, "openai-completions");
+	const requests = h.requests.length;
+	await h.start();
+	assert.equal(h.requests.length, requests, "unchanged modelApi keeps the cache");
+	await h.configure({ gateway: { ...discoveryProvider, modelApi: { "^gpt-6\\.1": "openai-responses" } } });
+	await h.start();
+	assert.equal(h.requests.length, requests + 1, "changing modelApi invalidates the cache");
+	assert.deepEqual(
+		h.registrations.get("gateway")!.models!.map((model) => model.api),
+		["openai-responses", undefined, undefined],
+	);
+	const cached = await readFile(join(h.dir, "extensions/pi-models-discovery/cache.json"), "utf8");
+	const beforeInvalid = h.requests.length;
+	await h.configure({ gateway: { ...discoveryProvider, modelApi: { "gpt-6(": "openai-responses" } } });
+	await h.start();
+	assert.match(h.warnings().join("\n"), /modelApi/);
+	const failed = h.registrations.get("gateway")!;
+	assert.equal(failed.models, undefined, "a different fingerprint's cache must not be registered");
+	await assert.rejects(() => failed.refreshModels!(refreshContext(false)));
+	await assert.rejects(() => failed.refreshModels!(refreshContext(true)), /modelApi/);
+	assert.equal(h.requests.length, beforeInvalid, "invalid patterns must not fetch");
+	assert.equal(await readFile(join(h.dir, "extensions/pi-models-discovery/cache.json"), "utf8"), cached);
+});
+
+test("malformed modelApi settings warn per provider without fetching, sharing valid results or discarding static fallback", async (t) => {
+	const h = await discoveryHarness(t, [{ id: "gpt-6.1-sol" }]);
+	const route = { ...discoveryProvider, models: [{ id: "handwritten" }] };
+	await h.configure({ healthy: discoveryProvider, route });
+	await h.start();
+	const requests = h.requests.length;
+	for (const modelApi of [null, false, 0, "", [], ["openai-responses"],
+		{ "^gpt-6": [] }, { "^gpt-6": null }, { "^gpt-6": 123 }, { "^gpt-6": false },
+		{ "^gpt-6": "" }, { "^gpt-6": " " }]) {
+		await h.configure({ healthy: discoveryProvider, empty: { ...discoveryProvider, modelApi: {} }, route: { ...route, modelApi } });
+		await h.start();
+		assert.equal(h.registrations.get("healthy")!.models![0].id, "gpt-6.1-sol");
+		assert.equal(h.registrations.get("empty")!.models![0].id, "gpt-6.1-sol");
+		const failed = h.registrations.get("route")!;
+		assert.equal(failed.models, undefined, "invalid mappings must preserve the handwritten fallback, not register the default route");
+		await assert.rejects(() => failed.refreshModels!(refreshContext(false)));
+		await assert.rejects(() => failed.refreshModels!(refreshContext(true)), /modelApi/);
+		assert.ok(h.warnings().some((message) => message.includes("route") && message.includes("modelApi")));
+		assert.equal(h.requests.length, requests + 1, "only the valid empty map's first discovery should fetch");
+	}
+	const registry = await piRegistry(h);
+	assert.equal(registry.find("route", "handwritten")!.api, "openai-completions");
+	assert.equal(registry.find("route", "gpt-6.1-sol"), undefined);
+});

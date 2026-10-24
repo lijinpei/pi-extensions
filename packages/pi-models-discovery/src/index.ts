@@ -22,9 +22,11 @@
  * 行为约定：
  * - 首次发现成功后，模型列表持久化到 ~/.pi/agent/extensions/pi-models-discovery/cache.json；
  *   之后每次启动先注册缓存并自动刷新；refreshOnStartup=false 时缓存命中不联网。配置指纹
- *   （baseUrl+api+apiKey+headers+compat+modelsUrl+modelIdRegex+metadataUrl+metadataProvider）变化时缓存自动失效。
+ *   （baseUrl+api+apiKey+headers+compat+modelsUrl+modelIdRegex+modelApi+metadataUrl+metadataProvider）变化时缓存自动失效。
  * - /config:model-discovery-refresh 强制重新拉取所有发现 provider 并更新缓存；
  *   /model 打开时触发的在线 refreshModels 同样走网络并同步更新缓存。
+ * - provider.modelApi（模型 id 正则 -> api 类型）逐模型覆盖 provider 级 api，
+ *   用于同一路由只对部分模型接受另一种协议的网关（如 Azure 的 gpt-6.x 必须走 /responses）。
  * - baseUrl / api 由扩展显式转发（pi 的 extension 组合层要求），
  *   apiKey / name / headers / compat 不写回注册配置，由 pi 的 models.json 层回落生效。
  * - provider 级 compat 会被合并进每个发现的模型（pi 的 models.json provider 级 compat
@@ -61,7 +63,7 @@ import {
 import { readSavedMetadata, saveMetadata } from "./metadata-store.ts";
 import { updateJsonFile } from "./storage.ts";
 import { registerModelTestCommand } from "./model-test.ts";
-import { compileModelIdRegex, readModelIdRegex } from "./model-filter.ts";
+import { compileModelApi, compileModelIdRegex, modelApiFor, readModelIdRegex } from "./model-filter.ts";
 export type { AdvertisedThinking, ModelMetadata } from "./metadata.ts";
 
 const i18n = createTranslator(loadCatalog(new URL("../locales/index.json", import.meta.url)));
@@ -93,6 +95,8 @@ interface DiscoveryProviderEntry {
 	baseUrl?: string;
 	modelsUrl?: string;
 	modelIdRegex?: string;
+	/** Preserve raw mappings so validation failures stay isolated to this provider. */
+	modelApi?: unknown;
 	metadataUrl?: string;
 	metadataProvider?: string;
 	refreshOnStartup?: boolean;
@@ -150,6 +154,7 @@ function providerFingerprint(entry: DiscoveryProviderEntry): string {
 		// 未配置 modelsUrl 时保留已有指纹，避免让旧缓存失效。
 		...(entry.modelsUrl ? [entry.modelsUrl] : []),
 		...(entry.modelIdRegex ? [{ modelIdRegex: entry.modelIdRegex }] : []),
+		...(entry.modelApi !== undefined ? [{ modelApi: entry.modelApi }] : []),
 		...(entry.metadataUrl ? [{ metadataUrl: entry.metadataUrl, metadataProvider: entry.metadataProvider ?? "" }] : []),
 	]);
 }
@@ -268,6 +273,7 @@ function pickDiscoveryProviders(data: Record<string, unknown>): DiscoveryProvide
 			baseUrl: typeof value.baseUrl === "string" ? value.baseUrl : undefined,
 			modelsUrl: typeof value.modelsUrl === "string" ? value.modelsUrl : undefined,
 			modelIdRegex: readModelIdRegex(value),
+			modelApi: value.modelApi,
 			metadataUrl: typeof value.metadataUrl === "string" ? value.metadataUrl.trim() : undefined,
 			metadataProvider: typeof value.metadataProvider === "string" ? value.metadataProvider.trim() : undefined,
 			refreshOnStartup: value.refreshOnStartup !== false,
@@ -465,6 +471,7 @@ async function fetchModels(
 		throw new Error(i18n.t("missingBaseUrl"));
 	}
 	const modelIdRegex = compileModelIdRegex(entry.modelIdRegex);
+	const modelApiRules = compileModelApi(entry.modelApi);
 	const headers: Record<string, string> = {};
 	for (const [key, rawValue] of Object.entries(entry.headers ?? {})) {
 		const resolved = resolveEnvValue(rawValue);
@@ -520,7 +527,8 @@ async function fetchModels(
 	const discovered: DiscoveredModels = { models: [], advertisedThinking: {} };
 	for (const endpointModel of available) {
 		const model = mergeMetadata(endpointModel, catalog && findMetadata(catalog, endpointModel.id, entry.id, entry.metadataProvider));
-		discovered.models.push(buildModel(model, entry));
+		const configuredApi = modelApiFor(modelApiRules, model.id);
+		discovered.models.push(buildModel(configuredApi ? { ...model, api: configuredApi } : model, entry));
 		if (model.thinking) discovered.advertisedThinking[model.id] = model.thinking;
 	}
 	return discovered;
@@ -529,7 +537,7 @@ async function fetchModels(
 function fetchWithCache(cache: FetchCache, entry: DiscoveryProviderEntry, notices: Notice[]): Promise<DiscoveredModels> {
 	const cacheKey = JSON.stringify([
 		getModelsUrl(entry), entry.api ?? "", entry.apiKey ?? "", entry.headers ?? {}, entry.compat ?? {},
-		entry.modelIdRegex ?? "",
+		entry.modelIdRegex ?? "", entry.modelApi === undefined ? {} : entry.modelApi,
 		entry.metadataUrl ?? "", entry.metadataProvider ?? "", entry.metadataUrl ? entry.id : "",
 	]);
 	let pending = cache.models.get(cacheKey);
@@ -693,6 +701,7 @@ function toPanelProvider(entry: DiscoveryProviderEntry): PanelProvider {
 		baseUrl: entry.baseUrl ?? "",
 		modelsUrl: entry.modelsUrl ?? "",
 		modelIdRegex: entry.modelIdRegex ?? "",
+		modelApi: entry.modelApi,
 		metadataUrl: entry.metadataUrl ?? "",
 		metadataProvider: entry.metadataProvider ?? "",
 		refreshOnStartup: entry.refreshOnStartup !== false,
@@ -723,6 +732,8 @@ async function persistProvider(provider: PanelProvider): Promise<{ backup: strin
 	const entry: Record<string, unknown> = { ...existing, baseUrl: provider.baseUrl, api: provider.api };
 	delete entry.modelIdPrefix;
 	entry.refreshOnStartup = provider.refreshOnStartup;
+	if (provider.modelApi === undefined) delete entry.modelApi;
+	else entry.modelApi = provider.modelApi;
 	for (const field of ["modelsUrl", "modelIdRegex", "metadataUrl", "metadataProvider"] as const) {
 		if (provider[field]) entry[field] = provider[field];
 		else delete entry[field];
@@ -749,6 +760,7 @@ async function persistNewProvider(provider: PanelProvider): Promise<{ backup: st
 		[DISCOVERY_MARKER]: true,
 		refreshOnStartup: provider.refreshOnStartup,
 	};
+	if (provider.modelApi !== undefined) entry.modelApi = provider.modelApi;
 	for (const field of ["modelsUrl", "modelIdRegex", "metadataUrl", "metadataProvider"] as const) {
 		if (provider[field]) entry[field] = provider[field];
 	}
@@ -872,6 +884,7 @@ function registerDiscoveryCommand(pi: ExtensionAPI, sink: NoticeSink) {
 							baseUrl: provider.baseUrl,
 							modelsUrl: provider.modelsUrl || undefined,
 							modelIdRegex: provider.modelIdRegex || undefined,
+							modelApi: provider.modelApi,
 							metadataUrl: provider.metadataUrl || undefined,
 							metadataProvider: provider.metadataProvider || undefined,
 							api: provider.api,
@@ -1009,6 +1022,7 @@ async function addProviderFromPanel(options: {
 			baseUrl: provider.baseUrl,
 			modelsUrl: provider.modelsUrl || undefined,
 			modelIdRegex: provider.modelIdRegex || undefined,
+			modelApi: provider.modelApi,
 			metadataUrl: provider.metadataUrl || undefined,
 			metadataProvider: provider.metadataProvider || undefined,
 			refreshOnStartup: provider.refreshOnStartup,

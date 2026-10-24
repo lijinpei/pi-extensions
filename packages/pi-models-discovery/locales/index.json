@@ -402,5 +402,29 @@
   "invalidModelIdRegex": {
     "zh-CN": "modelIdRegex 正则表达式无效（{reason}）",
     "en-US": "Invalid modelIdRegex pattern ({reason})"
+  },
+  "invalidModelApi": {
+    "zh-CN": "modelApi 的键 {pattern} 不是有效正则表达式（{reason}）",
+    "en-US": "Invalid modelApi pattern {pattern} ({reason})"
+  },
+  "invalidModelApiMap": {
+    "zh-CN": "modelApi 必须是将模型 ID 正则映射到 API 类型的 JSON 对象",
+    "en-US": "modelApi must be a JSON object mapping model ID patterns to API kinds"
+  },
+  "invalidModelApiValue": {
+    "zh-CN": "modelApi 的键 {pattern} 对应的 API 类型必须是非空字符串",
+    "en-US": "modelApi API kind for pattern {pattern} must be a nonempty string"
+  },
+  "invalidModelApiJson": {
+    "zh-CN": "modelApi JSON 无效（{reason}）",
+    "en-US": "Invalid modelApi JSON ({reason})"
+  },
+  "panelLabelModelApi": {
+    "zh-CN": "逐模型 API（JSON）",
+    "en-US": "Per-model API (JSON)"
+  },
+  "panelDescModelApi": {
+    "zh-CN": "正则到 API 类型的 JSON 对象，如 {\"^gpt-6\":\"openai-responses\"}；首个匹配生效，留空清除。",
+    "en-US": "JSON object mapping regexes to API kinds, e.g. {\"^gpt-6\":\"openai-responses\"}. First match wins; empty clears."
   }
 }

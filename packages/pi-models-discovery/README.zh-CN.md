@@ -18,7 +18,7 @@ pi install npm:pi-models-discovery
 /config:model-discovery
 ```
 
-命令打开配置面板，列出所有标记了 `discoverModels` 的 provider；选中某个 provider 打开它的字段页（发现开关、baseUrl、api 类型、apiKey、显示名、模型列表 URL、元数据 URL、元数据 provider），并可立即重新发现或删除它。添加 provider 时依次问 id、baseUrl、api 类型、apiKey（可留空）、显示名（可留空），写入 models.json 后**立即生效**（无需 /reload）。写入前自动备份到 `models.json.discovery-bak`。
+命令打开配置面板，列出所有标记了 `discoverModels` 的 provider；选中某个 provider 打开它的字段页（发现开关、baseUrl、api 类型、apiKey、显示名、模型列表 URL、元数据 URL、元数据 provider、模型 ID 正则、逐模型 API JSON、启动刷新），并可立即重新发现或删除它。添加 provider 时依次问 id、baseUrl、api 类型、apiKey（可留空）、显示名（可留空），写入 models.json 后**立即生效**（无需 /reload）。写入前自动备份到 `models.json.discovery-bak`。
 
 注意：写回时 models.json 中的注释与自定义排版不被保留（会格式化为 4 空格缩进）。
 
@@ -87,6 +87,29 @@ pi install npm:pi-models-discovery
 修改正则会使模型缓存失效，设置面板修改立即生效。面板会拒绝无效正则；文件中的无效正则或筛选后的空列表使用正常的匹配缓存/手写回退。列表 URL 不改变聊天 URL 或协议。共享列表只表示网关列出了模型，须用 `/model_test` 确认指定路由可用。
 
 已有的 `modelIdPrefix` 仍按字面前缀读取，并转换为转义后的锚定正则。显式设置的 `modelIdRegex` 优先，包括用于关闭筛选的空字符串。在面板中编辑 provider 时会保存新字段并删除 `modelIdPrefix`；转换后首次发现会刷新缓存。
+
+### 逐模型的 api 类型
+
+部分网关把所有模型列在同一路由，但该路由只接受其中一部分。例如 Azure 的 `gpt-6.1-sol` 在 `/chat/completions` 上拒绝「函数工具 + reasoning_effort」的组合，必须走 `/responses`。可用 `modelApi` 把模型 ID 映射到 api 类型：键是区分大小写的 JavaScript 正则源码，值覆盖匹配模型的 provider 级 `api`：
+
+```json
+{
+  "providers": {
+    "gateway": {
+      "baseUrl": "https://api.example.com/openai",
+      "api": "openai-completions",
+      "discoverModels": true,
+      "modelApi": { "^gpt-6": "openai-responses" }
+    }
+  }
+}
+```
+
+按对象键的顺序取首个命中的模式；未命中的模型沿用端点声明的 API 或 provider 的 `api`。provider 使用 `openai-completions` 时，端点若声明 `capabilities.chat: false` 且 `capabilities.responses: true`，扩展已自动切换。模式规则与 `modelIdRegex` 一致；`baseUrl` 不变，故该路由需同时提供两种协议。切换后请用 `/model_test provider/model` 验证。
+
+在 `/config:model-discovery` 的**逐模型 API（JSON）**行编辑同样的 JSON 对象，修改立即生效。留空清除覆盖。无效 JSON、格式错误的映射、非字符串或空白 API 值，以及无效正则均会在保存前被拒绝。
+
+修改 `modelApi` 会使模型缓存失效。文件中的无效设置会显示警告，仅使用匹配当前配置的缓存或手写的 `models`。无效修改不能复用原映射的缓存；没有手写模型时，不会注册发现的模型。
 
 ### 可选的标准目录元数据
 
@@ -158,7 +181,7 @@ pi install npm:pi-models-discovery
 
 ## 行为
 
-- **启动**：先注册匹配配置的模型缓存，再刷新端点列表与元数据目录。provider 设置 `refreshOnStartup: false` 后，缓存命中时跳过启动联网刷新；缓存文件位于 `~/.pi/agent/extensions/pi-models-discovery/cache.json`。provider 配置指纹（baseUrl+api+apiKey+headers+compat+modelsUrl+modelIdRegex+metadataUrl+metadataProvider）变化时缓存自动失效，重新走网络发现。
+- **启动**：先注册匹配配置的模型缓存，再刷新端点列表与元数据目录。provider 设置 `refreshOnStartup: false` 后，缓存命中时跳过启动联网刷新；缓存文件位于 `~/.pi/agent/extensions/pi-models-discovery/cache.json`。provider 配置指纹（baseUrl+api+apiKey+headers+compat+modelsUrl+modelIdRegex+modelApi+metadataUrl+metadataProvider）变化时缓存自动失效，重新走网络发现。
 - **在线刷新**：`/config:model-discovery-refresh` 或 `/model` 打开时触发的 `refreshModels` 在线重新发现，并同步更新缓存。网关发现失败时，钩子抛错，让 Pi 报告刷新失败并保留之前的模型列表；其他 provider 仍可正常刷新。
 - **离线 / 拉取失败**：保留匹配配置的模型缓存，否则保留 models.json 里手写的 `models`（如有，作为回退），并通过会话内 notify 显式警告，不静默降级；单个 provider 失败不影响其他 provider。
 - **apiKey 解析**（仅发现请求）：支持字面量与 `$ENV_VAR` / `${ENV_VAR}` 插值；`!command` 形式跳过发现并显式警告（聊天请求仍由 pi 自身解析执行，不受影响）。

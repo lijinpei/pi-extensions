@@ -28,6 +28,12 @@ description: "配置与排查 models.json 的动态模型发现、缓存刷新�
 
 路由可正常聊天但 `/models` 为空时，可显式把 `modelsUrl` 指向同网关的共享模型列表，并用区分大小写的 JavaScript 正则源码 `modelIdRegex`（如 `^claude-` 或 `^(claude-|gpt-)`）限定模型。不加 `/.../` 分隔符或标志，留空不过滤，`^`/`$` 限定匹配位置；JSON 中反斜杠须转义。无效正则走匹配缓存/手写回退，面板拒绝保存；旧 `modelIdPrefix` 按字面前缀兼容读取，面板编辑后转为新字段。模型 ID 保持原样，聊天仍使用 provider 的 `baseUrl` 和 `api`。不要把其他协议的所有模型注册到此路由；用 `/model_test provider/model` 验证实际可用性。
 
+## 逐模型 api
+
+同一路由只对部分模型接受另一种协议时（如 Azure 的 `gpt-6.1-sol` 在 `/chat/completions` 上拒绝「函数工具 + `reasoning_effort`」，必须走 `/responses`），用 provider 的 `modelApi` 覆盖：键是模型 id 正则（规则同 `modelIdRegex`），值是非空 api 字符串，取首个命中；未命中沿用端点声明的 API 或 provider 的 `api`。`baseUrl` 不变，该路由需同时提供两种协议。provider 使用 `openai-completions` 且端点声明 `capabilities.chat: false`、`capabilities.responses: true` 时已自动切换。
+
+优先在 `/config:model-discovery` 的「逐模型 API（JSON）」行输入映射对象，修改立即生效，留空清除；面板拒绝无效 JSON、映射格式、API 值和正则。修改会使缓存失效。文件中的无效设置显式警告，仅回退到匹配当前配置的缓存或手写 `models`；无效修改不能复用原映射缓存，没有手写模型时不会注册发现的模型。切换后用 `/model_test provider/model` 验证。
+
 ## 思考等级
 
 发现的模型默认隐藏 `xhigh` / `max`（映射为 `null`），标准档位沿用 Pi 默认映射。provider 的 `compat.thinkingLevelMap` 可显式开启支持的档位或将不支持的档位置 `null`；非推理服务用 `compat.reasoning: false` 关闭推理，必要时配合 `compat.supportsReasoningEffort: false`。这两个扩展配置字段会提取到模型顶层，其余 compat 正常转发。逐模型差异用 `modelOverrides` 按 model.id 覆盖。旧缓存启动时会应用当前 compat 配置，无需联网刷新。

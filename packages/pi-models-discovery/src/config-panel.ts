@@ -26,7 +26,7 @@ import {
 	Text,
 } from "@earendil-works/pi-tui";
 import { createTranslator, loadCatalog, notifyWithSource, NOTICE_TAG_COLOR } from "pi-extensions-i18n";
-import { compileModelIdRegex } from "./model-filter.ts";
+import { compileModelApi, compileModelIdRegex } from "./model-filter.ts";
 
 const i18n = createTranslator(loadCatalog(new URL("../locales/index.json", import.meta.url)));
 
@@ -48,6 +48,7 @@ export const PROVIDER_FIELD = {
 	baseUrl: "baseUrl",
 	modelsUrl: "modelsUrl",
 	modelIdRegex: "modelIdRegex",
+	modelApi: "modelApi",
 	metadataUrl: "metadataUrl",
 	metadataProvider: "metadataProvider",
 	refreshOnStartup: "refreshOnStartup",
@@ -87,6 +88,8 @@ export interface PanelProvider {
 	baseUrl: string;
 	modelsUrl: string;
 	modelIdRegex: string;
+	/** Keep malformed file values editable; validate when the row changes. */
+	modelApi: unknown;
 	metadataUrl: string;
 	metadataProvider: string;
 	refreshOnStartup: boolean;
@@ -137,6 +140,7 @@ const PROVIDER_ROWS: readonly {
 	{ id: PROVIDER_FIELD.api, kind: "choice", labelKey: "panelLabelApi", descriptionKey: "panelDescApi" },
 	{ id: PROVIDER_FIELD.apiKey, kind: "text", labelKey: "panelLabelApiKey", descriptionKey: "panelDescApiKey" },
 	{ id: PROVIDER_FIELD.modelIdRegex, kind: "text", labelKey: "panelLabelModelIdRegex", descriptionKey: "panelDescModelIdRegex" },
+	{ id: PROVIDER_FIELD.modelApi, kind: "text", labelKey: "panelLabelModelApi", descriptionKey: "panelDescModelApi" },
 	{ id: PROVIDER_FIELD.rediscover, kind: "action", labelKey: "panelLabelRediscover", descriptionKey: "panelDescRediscover" },
 	{ id: PROVIDER_FIELD.remove, kind: "action", labelKey: "panelLabelRemove", descriptionKey: "panelDescRemove" },
 ];
@@ -190,6 +194,8 @@ function readProviderField(provider: PanelProvider, id: ProviderFieldId): string
 			return provider.modelsUrl;
 		case PROVIDER_FIELD.modelIdRegex:
 			return provider.modelIdRegex;
+		case PROVIDER_FIELD.modelApi:
+			return JSON.stringify(provider.modelApi) ?? "";
 		case PROVIDER_FIELD.metadataUrl:
 			return provider.metadataUrl;
 		case PROVIDER_FIELD.metadataProvider:
@@ -245,6 +251,18 @@ export function applyProviderChange(
 			const source = value === i18n.t("panelValueUnset") ? "" : value;
 			compileModelIdRegex(source);
 			return { ...provider, modelIdRegex: source };
+		}
+		case PROVIDER_FIELD.modelApi: {
+			let modelApi: unknown;
+			if (value !== i18n.t("panelValueUnset") && value.trim()) {
+				try {
+					modelApi = JSON.parse(value);
+				} catch (error) {
+					throw new Error(i18n.t("invalidModelApiJson", { reason: error instanceof Error ? error.message : String(error) }));
+				}
+			}
+			compileModelApi(modelApi);
+			return { ...provider, modelApi };
 		}
 		case PROVIDER_FIELD.baseUrl:
 			return { ...provider, baseUrl: value.trim() };
@@ -587,6 +605,7 @@ export async function openDiscoveryPanel(
 				baseUrl: input.baseUrl,
 				modelsUrl: "",
 				modelIdRegex: "",
+				modelApi: undefined,
 				metadataUrl: "",
 				metadataProvider: "",
 				refreshOnStartup: true,

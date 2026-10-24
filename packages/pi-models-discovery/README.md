@@ -18,7 +18,7 @@ pi install npm:pi-models-discovery
 /config:model-discovery
 ```
 
-Interactively add / remove / rediscover providers. The command opens a settings panel that lists every provider marked with `discoverModels`; selecting one opens its fields (enable/disable discovery, baseUrl, api type, apiKey, display name, model-list URL, metadata URL, metadata provider, model ID prefix, startup refresh) plus actions to rediscover or remove it. Adding a provider asks for id, baseUrl, api type, apiKey (optional) and display name (optional). Changes are written to models.json and take effect **immediately** (no /reload required). A backup is written to `models.json.discovery-bak` before each write.
+Interactively add / remove / rediscover providers. The command opens a settings panel that lists every provider marked with `discoverModels`; selecting one opens its fields (enable/disable discovery, baseUrl, api type, apiKey, display name, model-list URL, metadata URL, metadata provider, model ID regex, per-model API JSON, startup refresh) plus actions to rediscover or remove it. Adding a provider asks for id, baseUrl, api type, apiKey (optional) and display name (optional). Changes are written to models.json and take effect **immediately** (no /reload required). A backup is written to `models.json.discovery-bak` before each write.
 
 Note: comments and custom formatting in models.json are not preserved on write (the file is reformatted with 4-space indentation).
 
@@ -87,6 +87,29 @@ The regex is optional; empty or omitted keeps all conversational models. Supply 
 Regex changes invalidate the model cache and take effect immediately in the settings panel. Invalid patterns are rejected by the panel; invalid file settings and filtered empty lists use the normal matching-cache/static fallback. The list URL does not change the inference URL or protocol. A shared list advertises models for the gateway; test a model with `/model_test` to confirm that it works on the selected route.
 
 Existing `modelIdPrefix` settings are still read as literal prefixes and converted to escaped, anchored regexes. An explicit `modelIdRegex` takes precedence, including an empty string to disable filtering. Editing a provider in the settings panel saves the new field and removes `modelIdPrefix`; the first discovery after conversion refreshes the cache.
+
+### Per-model API kind
+
+Some gateways list every model on one route but only accept part of them there. Azure's `gpt-6.1-sol`, for example, rejects function tools combined with `reasoning_effort` on `/chat/completions` and requires `/responses`. Map model IDs to an API kind with `modelApi`; the key is a case-sensitive JavaScript regex source, the value overrides the provider `api` for matching models:
+
+```json
+{
+  "providers": {
+    "gateway": {
+      "baseUrl": "https://api.example.com/openai",
+      "api": "openai-completions",
+      "discoverModels": true,
+      "modelApi": { "^gpt-6": "openai-responses" }
+    }
+  }
+}
+```
+
+The first matching pattern wins; unmatched models keep their endpoint-declared API or the provider `api`. An endpoint that advertises `capabilities.chat: false` with `capabilities.responses: true` already switches on its own when the provider uses `openai-completions`. Patterns follow the `modelIdRegex` rules, and `baseUrl` stays the same, so the route must serve both protocols. Confirm a switched model with `/model_test provider/model`.
+
+Edit the same JSON object in the **Per-model API (JSON)** row of `/config:model-discovery`; changes apply immediately. Empty input clears the override. Invalid JSON, malformed maps, non-string or blank API values, and invalid patterns are rejected before saving.
+
+Changing `modelApi` invalidates the model cache. Invalid file settings produce a warning and use only a cache matching the current configuration or handwritten `models`. An invalid edit cannot reuse the previous mapping's cache; without handwritten models, no discovered models are registered.
 
 ### Optional canonical metadata
 
@@ -158,7 +181,7 @@ Tests make real requests and may incur gateway charges. Discovery itself only re
 
 ## Behavior
 
-- **Startup**: register matching cached models, then refresh the endpoint list and configured metadata catalog. Set provider `refreshOnStartup: false` to skip the startup network refresh when cached models exist. The model cache lives at `~/.pi/agent/extensions/pi-models-discovery/cache.json`. The cache is invalidated automatically when the provider configuration fingerprint (baseUrl+api+apiKey+headers+compat+modelsUrl+modelIdRegex+metadataUrl+metadataProvider) changes, triggering a fresh network discovery.
+- **Startup**: register matching cached models, then refresh the endpoint list and configured metadata catalog. Set provider `refreshOnStartup: false` to skip the startup network refresh when cached models exist. The model cache lives at `~/.pi/agent/extensions/pi-models-discovery/cache.json`. The cache is invalidated automatically when the provider configuration fingerprint (baseUrl+api+apiKey+headers+compat+modelsUrl+modelIdRegex+modelApi+metadataUrl+metadataProvider) changes, triggering a fresh network discovery.
 - **Online refresh**: `/config:model-discovery-refresh`, or the `refreshModels` hook triggered when opening `/model`, rediscovers online and updates the cache. If gateway discovery fails, the hook rejects so Pi reports the refresh failure while retaining the previous model list. Other providers can still refresh successfully.
 - **Offline / fetch failure**: matching cached models are retained, or handwritten `models` in models.json (if any) are kept as a fallback, and an explicit warning is surfaced via in-session notify — never a silent degradation. One provider failing does not affect the others.
 - **apiKey resolution** (discovery request only): supports literals and `$ENV_VAR` / `${ENV_VAR}` interpolation; `!command` values skip discovery with an explicit warning (chat requests are still resolved by pi itself and are unaffected).

@@ -8,7 +8,10 @@
       "metadataUrl": "https://models.dev/api.json",
       "metadataProvider": "anthropic",
       "refreshOnStartup": true,
-      "modelIdRegex": ""
+      "modelIdRegex": "",
+      "modelApi": {
+        "^gpt-6": "openai-responses"
+      }
     }
   }
 }
